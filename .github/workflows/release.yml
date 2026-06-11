@@ -18,7 +18,7 @@ jobs:
 
       - name: Cross-compile binaries (Sky compiler docker image)
         run: |
-          docker run --rm -e GITHUB_REF_NAME="$GITHUB_REF_NAME" \
+          docker run --rm -e GITHUB_REF_NAME="$GITHUB_REF_NAME" -e GOFLAGS=-buildvcs=false \
             -v "$PWD:/app" -w /app --entrypoint bash anzel/sky:latest -c '
             set -euo pipefail
             sky build src/Main.sky          # generates pure-Go output in sky-out/
