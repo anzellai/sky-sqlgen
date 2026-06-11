@@ -1,0 +1,42 @@
+# sky.toml — project configuration.
+# Full reference: https://github.com/anzellai/sky#skytoml
+
+name    = "sky-sqlgen"
+version = "0.1.0"
+entry   = "src/Main.sky"
+bin     = "app"
+
+[source]
+root = "src"
+
+[sqlgen]
+dialect     = "sqlite"            # "sqlite" | "postgres"
+schema      = ["sql/users.sql"]   # DDL globs — build the catalog
+queries     = ["sql/users.sql"]   # DML globs — generate query modules
+out         = "src/Gen"           # output directory
+module      = "Gen"               # module prefix (Gen.Schema, Gen.Users, …)
+singularize = true                # table → singular Model name
+verify      = true                # run sky check on output after emit
+
+# [live]            # Sky.Live runtime (uncomment to configure)
+# port         = 8000
+# store        = "memory"   # memory | sqlite | postgres | redis
+# storePath    = "sky.db"   # sqlite file or postgres / redis conn str
+# ttl          = 1800         # session TTL in seconds
+# static       = "public"   # static asset directory
+# maxBodyBytes = 5242880      # cap for /_sky/event (5 MiB default; bump for onFile/onImage uploads)
+
+# [auth]            # Std.Auth configuration (uncomment to use)
+# driver     = "jwt"         # jwt | session | oauth
+# secret     = "change-me"   # JWT signing secret (use env var in prod)
+# tokenTtl   = 86400           # token lifetime in seconds
+# cookieName = "sky_auth"
+
+# [database]        # Std.Db configuration (uncomment to use)
+# driver = "sqlite"          # sqlite | postgres
+# path   = "app.db"          # sqlite file or postgres conn str
+
+# ["go.dependencies"]        # `sky add <pkg>` records these here
+
+# [dependencies]              # Sky-source dependencies (from git)
+# "github.com/anzellai/sky-tailwind" = "latest"

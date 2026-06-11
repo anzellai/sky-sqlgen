@@ -1,0 +1,26 @@
+name: CI
+
+# Build the generator and verify every bundled example compiles, on every push
+# to main and on PRs. Does NOT release — releases happen on tag (see release.yml).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + verify examples (Sky compiler docker image)
+        run: |
+          docker run --rm -v "$PWD:/app" -w /app --entrypoint bash anzel/sky:latest -c '
+            set -euo pipefail
+            sky build src/Main.sky
+            for cfg in sky*.toml; do
+              echo "== $cfg =="
+              ./sky-out/app --config "$cfg"   # regenerates + runs sky check on output (verify=true)
+            done
+          '

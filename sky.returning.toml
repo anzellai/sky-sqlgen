@@ -1,0 +1,10 @@
+# Standalone config for the RETURNING example (sql/returning.sql).
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/returning.sql"]
+queries     = ["sql/returning.sql"]
+out         = "src/GenReturning"
+module      = "GenReturning"
+singularize = true
+verify      = true

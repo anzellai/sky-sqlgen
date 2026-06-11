@@ -1,0 +1,2037 @@
+module SqlGen.Infer exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Dict as Dict
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+import SqlGen.Catalog as Catalog
+import SqlGen.Naming as Naming
+import SqlGen.Parser as Parser
+
+-- Adjacency typing for SELECT / UPDATE / DELETE
+-- ===========================================================================
+-- Entry
+-- ===========================================================================
+
+-- ===========================================================================
+-- Scope-aware adjacency typing (SELECT with FROM + JOINs, WHERE / ON)
+-- ===========================================================================
+-- Single-token fold with explicit state. (The cons-pattern lowering bug that
+-- originally forced this style — IMPL-PUSHBACK §7.6 — was fixed upstream in
+-- #583, so multi-constructor cons are safe again; the fold is kept by choice
+-- because the named state reads more clearly than a `t. col` lookahead.)
+--   prevWord  the last word seen (a potential `t.` qualifier OR a column)
+--   dotArmed  we just saw `prevWord .`, so the next word is `prevWord.col`
+-- Type of a (possibly qualified) column in scope; Nothing if unknown/ambiguous.
+
+-- ===========================================================================
+-- Multi-table scope (FROM + JOINs) with outer-join nullability demotion
+-- ===========================================================================
+-- ===========================================================================
+-- Runtime SQL chunking for IN (@list) statements.
+-- Splits the raw SQL at each LIST-param marker; scalar @params are rendered to
+-- `?` inline (list expansion is sqlite-only). Result: chunks (n+1) interleaved
+-- with listFields (n), so the runtime builds:
+--   chunk0 ++ placeholders (length params.f0) ++ chunk1 ++ ...
+-- ===========================================================================
+-- Demotion analysis over the join list.  Entry indices: FROM = 0, join k -> k+1.
+--   LEFT / FULL  -> demote the right (joined) table.
+--   RIGHT / FULL -> demote the whole left side (every entry <= the join index).
+-- Param-typing scope: for a derived-table query, also expose the subquery's
+-- own (one-level) base tables so a WHERE param inside the subquery can type.
+-- ===========================================================================
+-- DEFAULT-omittable INSERT (`-- @omit col, ...`)
+-- ===========================================================================
+-- Opt-in per statement. Omittable columns become SqlField-typed params; the
+-- whole INSERT then emits a runtime builder (see Emit.emitOmitBuilder). A
+-- statement with no @omit columns keeps the static path (byte-identical).
+-- ===========================================================================
+-- Param occurrences
+-- ===========================================================================
+type alias Prepared =
+    { anno : Annotation
+    , parsed : ParsedStmt
+    , tokens : List Token
+    , rawSql : String
+    , line : Int
+    }
+
+type alias ParamInfo =
+    { skyType : SkyType
+    , nullable : Bool
+    }
+
+type alias ParamOcc =
+    { name : String
+    , force : Force
+    }
+
+
+infer : Dialect -> Catalog -> Prepared -> Result Error ResolvedStatement
+infer dialect cat prep =
+    let
+        anno = prep.anno
+        occs = paramOccurrences prep.tokens
+        distinct = distinctNames occs []
+        omits = omitNames anno.directives
+    in
+        omitStmtCheck omits prep.parsed
+            |> Result.andThen (\_ -> listParamCheck dialect occs prep.tokens)
+            |> Result.andThen
+                   (\listNames ->
+                       resolveParams cat prep occs distinct listNames
+                           |> Result.andThen
+                                  (\params ->
+                                      resolveOmit cat prep omits distinct params
+                                          |> Result.andThen
+                                                 (\omitR ->
+                                                     resolveResult cat prep
+                                                         |> Result.map
+                                                                (\result ->
+                                                                    let
+                                                                        chunks =
+                                                                            buildChunks
+                                                                                listNames
+                                                                                prep.rawSql
+                                                                    in
+                                                                        { baseName = anno.name
+                                                                        , fnName = Naming.fnName
+                                                                              anno.name
+                                                                        , card = anno.card
+                                                                        , sql = rewritePlaceholders
+                                                                              dialect
+                                                                              prep.rawSql
+                                                                        , params = omitR.params
+                                                                        , argOrder = List.map
+                                                                              (\o ->
+                                                                                  Naming.fieldName
+                                                                                      o.name)
+                                                                              occs
+                                                                        , result = result
+                                                                        , sqlChunks = chunks.chunks
+                                                                        , sqlListFields = chunks.listFields
+                                                                        , insertCols = omitR.insertCols
+                                                                        , insertTable = omitR.insertTable
+                                                                        }))))
+
+type alias OmitResult =
+    { params : List ResolvedParam
+    , insertCols : List InsertCol
+    , insertTable : String
+    }
+
+
+omitNames : List Directive -> List String
+omitNames dirs =
+    List.concatMap
+        (\d ->
+            case d of
+
+                DOmit cols ->
+                    cols
+
+                _ ->
+                    [])
+        dirs
+-- @omit is only meaningful on an INSERT. With a RETURNING clause it emits
+-- Db.insertFieldsReturning; without one, Db.insertFields.
+
+
+omitStmtCheck : List String -> ParsedStmt -> Result Error ()
+omitStmtCheck omits parsed =
+    if List.isEmpty omits then
+        Ok ()
+
+    else
+        case parsed of
+
+            PInsert _ ->
+                Ok ()
+
+            _ ->
+                Err
+                    (Error.invalidInput
+                        "@omit is only valid on an INSERT statement")
+
+
+resolveOmit : Catalog -> Prepared -> List String -> List String -> List ResolvedParam -> Result Error OmitResult
+resolveOmit cat prep omits distinct params =
+    if List.isEmpty omits then
+        Ok { params = params, insertCols = [], insertTable = "" }
+
+    else
+        case prep.parsed of
+
+            PInsert ins ->
+                resolveInsertOmit cat ins omits distinct params
+
+            _ ->
+                Ok { params = params, insertCols = [], insertTable = "" }
+
+
+resolveInsertOmit : Catalog -> InsertStmt -> List String -> List String -> List ResolvedParam -> Result Error OmitResult
+resolveInsertOmit cat ins omits distinct params =
+    case Catalog.lookup ins.table cat of
+
+        Nothing ->
+            Err (Error.invalidInput ("unknown table in INSERT: " ++ ins.table))
+
+        Just table ->
+            checkOmitColumns omits ins table
+                |> Result.andThen
+                       (\_ ->
+                           buildInsertCols ins.columns distinct params omits []
+                               |> Result.map
+                                      (\cols ->
+                                          { params = markOmitParams omits cols params
+                                          , insertCols = cols
+                                          , insertTable = ins.table
+                                          }))
+-- Each @omit column must (a) be one of the INSERT's columns and (b) either be
+-- nullable or carry a DEFAULT — omitting a NOT NULL column with no DEFAULT
+-- always violates NOT NULL, so loud-fail.
+
+
+checkOmitColumns : List String -> InsertStmt -> CatTable -> Result Error ()
+checkOmitColumns omits ins table =
+    case omits of
+
+        [] ->
+            Ok ()
+
+        col :: rest ->
+            if not (List.member (String.toLower col) (lowerAll ins.columns)) then
+                Err
+                    (Error.invalidInput
+                        ("-- @omit " ++ col ++ ": column " ++ col
+                            ++ " is not in this INSERT's column list"))
+
+            else
+                case findCol col table of
+
+                    Nothing ->
+                        Err
+                            (Error.invalidInput
+                                ("-- @omit " ++ col ++ ": column " ++ col
+                                    ++ " is not a column of table "
+                                    ++ table.name))
+
+                    Just c ->
+                        if not c.nullable && not c.hasDefault then
+                            Err
+                                (Error.invalidInput
+                                    ("-- @omit " ++ col ++ ": column " ++ col
+                                        ++ " has no DEFAULT and is NOT NULL — omitting it will always violate NOT NULL"))
+
+                        else
+                            checkOmitColumns rest ins table
+
+
+lowerAll : List String -> List String
+lowerAll xs =
+    List.map String.toLower xs
+
+
+buildInsertCols : List String -> List String -> List ResolvedParam -> List String -> List InsertCol -> Result Error (List InsertCol)
+buildInsertCols cols names params omits acc =
+    case ( cols, names ) of
+
+        ( [], [] ) ->
+            Ok (List.reverse acc)
+
+        ( col :: colsRest, name :: namesRest ) ->
+            let
+                field = Naming.fieldName name
+            in
+                case findParam field params of
+
+                    Nothing ->
+                        Err
+                            (Error.invalidInput
+                                ("internal: no resolved param for INSERT column "
+                                    ++ col))
+
+                    Just p ->
+                        buildInsertCols
+                            colsRest
+                            namesRest
+                            params
+                            omits
+                            ({ sqlCol = col
+                            , field = field
+                            , skyType = p.skyType
+                            , nullable = p.nullable
+                            , omittable = List.member (String.toLower col) (lowerAll omits)
+                            }
+                                :: acc)
+
+        _ ->
+            Err (Error.invalidInput "INSERT column/param mismatch (@omit)")
+
+
+findParam : String -> List ResolvedParam -> Maybe ResolvedParam
+findParam field params =
+    List.find (\p -> p.field == field) params
+
+
+markOmitParams : List String -> List InsertCol -> List ResolvedParam -> List ResolvedParam
+markOmitParams omits cols params =
+    let
+        omitFields =
+            List.filterMap
+                (\ic ->
+                    if ic.omittable then
+                        Just ic.field
+
+                    else
+                        Nothing)
+                cols
+    in
+        List.map (\p -> setParamOmit (List.member p.field omitFields) p) params
+-- Construct a fresh record (not `{ p | isOmit = … }`) — a record-update inside
+-- List.map narrows the element type and zeroes the other fields here.
+
+
+setParamOmit : Bool -> ResolvedParam -> ResolvedParam
+setParamOmit omit p =
+    { field = p.field
+    , skyType = p.skyType
+    , nullable = p.nullable
+    , isList = p.isList
+    , isOmit = omit
+    }
+
+
+paramOccurrences : List Token -> List ParamOcc
+paramOccurrences tokens =
+    List.filterMap
+        (\t ->
+            case t of
+
+                TParam name force ->
+                    Just { name = name, force = force }
+
+                _ ->
+                    Nothing)
+        tokens
+
+
+distinctNames : List ParamOcc -> List String -> List String
+distinctNames occs acc =
+    case occs of
+
+        [] ->
+            List.reverse acc
+
+        o :: rest ->
+            if List.member o.name acc then
+                distinctNames rest acc
+
+            else
+                distinctNames rest (o.name :: acc)
+
+
+firstForce : String -> List ParamOcc -> Force
+firstForce name occs =
+    case List.find (\o -> o.name == name && o.force /= FNone) occs of
+
+        Just o ->
+            o.force
+
+        Nothing ->
+            FNone
+-- ===========================================================================
+-- IN (@list) detection
+-- A param is a LIST param iff it appears as the sole argument of `IN (...)`:
+-- `col IN (@ids)`. It is then typed `List <base>` and expanded at runtime.
+-- ===========================================================================
+
+
+upperWordTok : Token -> String
+upperWordTok t =
+    case t of
+
+        TWord w ->
+            String.toUpper w
+
+        _ ->
+            ""
+
+
+collectInList : List Token -> List String -> List String
+collectInList tokens acc =
+    case tokens of
+
+        [] ->
+            List.reverse acc
+
+        t :: rest ->
+            -- a derived table has an empty modelName (no Schema Model) -> never
+            -- reuse; always emit a Row at the outer level
+            if upperWordTok t == "IN" then
+                case matchInParenOpen rest of
+
+                    Just nm ->
+                        collectInList rest (nm :: acc)
+
+                    Nothing ->
+                        collectInList rest acc
+-- The three matchers below are split into single-element cons steps. The
+-- nested-cons lowering bug that originally forced this (IMPL-PUSHBACK §7.6)
+-- was fixed upstream in #583; the stepwise form is kept by choice for clarity.
+
+            else
+                collectInList rest acc
+
+
+matchInParenOpen : List Token -> Maybe String
+matchInParenOpen tokens =
+    case tokens of
+
+        t :: rest ->
+            if isSymTok "(" t then
+                matchInParenParam rest
+
+            else
+                Nothing
+-- ===========================================================================
+-- Result column inference
+-- ===========================================================================
+
+        [] ->
+            Nothing
+-- ===========================================================================
+-- Placeholder rewrite
+-- ===========================================================================
+
+
+matchInParenParam : List Token -> Maybe String
+matchInParenParam tokens =
+    case tokens of
+
+        t :: rest ->
+            case t of
+
+                TParam name _ ->
+                    matchInParenClose name rest
+
+                _ ->
+                    Nothing
+
+        [] ->
+            Nothing
+
+
+matchInParenClose : String -> List Token -> Maybe String
+matchInParenClose name tokens =
+    case tokens of
+
+        t :: _ ->
+            if isSymTok ")" t then
+                Just name
+
+            else
+                Nothing
+
+        [] ->
+            Nothing
+
+
+isSymTok : String -> Token -> Bool
+isSymTok s t =
+    case t of
+
+        TSym x ->
+            x == s
+
+        _ ->
+            False
+-- Determine the list params (sqlite-only), rejecting mixed list/scalar usage.
+
+
+listParamCheck : Dialect -> List ParamOcc -> List Token -> Result Error (List String)
+listParamCheck dialect occs tokens =
+    let
+        inNames = collectInList tokens []
+        distinctList = distinctStrings inNames []
+    in
+        if List.isEmpty distinctList then
+            Ok []
+
+        else
+            case dialect of
+
+                DPostgres ->
+                    Err
+                        (Error.invalidInput
+                            "IN (@list) expansion is sqlite-only in v1.1 (postgres $N renumbering of a dynamic list is not supported); use dialect = \"sqlite\"")
+
+                DSqlite ->
+                    checkListMixed distinctList inNames occs []
+
+
+checkListMixed : List String -> List String -> List ParamOcc -> List String -> Result Error (List String)
+checkListMixed distinctList inNames occs acc =
+    case distinctList of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        nm :: rest ->
+            let
+                inCount = countStr nm inNames
+                totalCount =
+                    List.length (List.filter (\o -> o.name == nm) occs)
+            in
+                if inCount /= totalCount then
+                    Err
+                        (Error.invalidInput
+                            ("parameter @" ++ nm
+                                ++ " is used both inside and outside IN (...); a list param may only appear as `IN (@"
+                                ++ nm
+                                ++ ")`"))
+
+                else
+                    checkListMixed rest inNames occs (nm :: acc)
+
+
+countStr : String -> List String -> Int
+countStr x xs =
+    List.length (List.filter (\y -> y == x) xs)
+
+
+distinctStrings : List String -> List String -> List String
+distinctStrings items acc =
+    case items of
+
+        [] ->
+            List.reverse acc
+
+        x :: rest ->
+            if List.member x acc then
+                distinctStrings rest acc
+
+            else
+                distinctStrings rest (x :: acc)
+
+type alias ChunkResult =
+    { chunks : List String
+    , listFields : List String
+    }
+
+
+buildChunks : List String -> String -> ChunkResult
+buildChunks listNames rawSql =
+    if List.isEmpty listNames then
+        { chunks = [], listFields = [] }
+
+    else
+        let
+            final =
+                chunkGo
+                    listNames
+                    (String.toList rawSql)
+                    { buf = [], chunks = [], listFields = [] }
+        in
+            { chunks = List.reverse (flushChunk final.buf final.chunks)
+            , listFields = List.reverse final.listFields
+            }
+
+type alias ChunkState =
+    { buf : List Char
+    , chunks : List String
+    , listFields : List String
+    }
+
+
+flushChunk : List Char -> List String -> List String
+flushChunk buf chunks =
+    String.fromList (List.reverse buf) :: chunks
+
+
+chunkGo : List String -> List Char -> ChunkState -> ChunkState
+chunkGo listNames chars st =
+    case chars of
+
+        [] ->
+            st
+
+        '@' :: rest ->
+            let
+                ( name, rem1 ) = spanIdent rest []
+                rem2 = dropForceChar rem1
+            in
+                if List.member name listNames then
+                    chunkGo
+                        listNames
+                        rem2
+                        { st | chunks = flushChunk st.buf st.chunks
+                        , listFields = Naming.fieldName name :: st.listFields
+                        , buf = []
+                        }
+
+                else
+                    chunkGo listNames rem2 { st | buf = '?' :: st.buf }
+
+        c :: rest ->
+            chunkGo listNames rest { st | buf = c :: st.buf }
+-- ===========================================================================
+-- Param typing
+-- ===========================================================================
+
+
+resolveParams : Catalog -> Prepared -> List ParamOcc -> List String -> List String -> Result Error (List ResolvedParam)
+resolveParams cat prep occs distinct listNames =
+    let
+        directives = directiveMap prep.anno.directives
+        typingResult =
+            case prep.parsed of
+
+                PInsert ins ->
+                    insertParamTyping cat ins distinct
+
+                PSelect sel ->
+                    buildScope cat sel
+                        |> Result.andThen
+                               (\scope ->
+                                   buildParamScope cat sel scope
+                                       |> Result.map
+                                              (\pscope ->
+                                                  adjScope pscope prep.tokens))
+
+                _ ->
+                    Ok (adjacencyTyping cat (stmtTable prep.parsed) prep.tokens)
+    in
+        typingResult
+            |> Result.andThen
+                   (\typed ->
+                       resolveParamList
+                           occs
+                           distinct
+                           listNames
+                           directives
+                           typed
+                           [])
+
+
+resolveParamList : List ParamOcc -> List String -> List String -> Dict String TypeSpec -> Dict String ParamInfo -> List ResolvedParam -> Result Error (List ResolvedParam)
+resolveParamList occs names listNames directives typed acc =
+    case names of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        name :: rest ->
+            case resolveOneParam occs name listNames directives typed of
+
+                Err e ->
+                    Err e
+
+                Ok rp ->
+                    resolveParamList
+                        occs
+                        rest
+                        listNames
+                        directives
+                        typed
+                        (rp :: acc)
+
+
+resolveOneParam : List ParamOcc -> String -> List String -> Dict String TypeSpec -> Dict String ParamInfo -> Result Error ResolvedParam
+resolveOneParam occs name listNames directives typed =
+    let
+        force = firstForce name occs
+        field = Naming.fieldName name
+        listFlag = List.member name listNames
+    in
+        case Dict.get name directives of
+
+            Just spec ->
+                Ok
+                    { field = field
+                    , skyType = spec.base
+                    , nullable = applyForceNull force spec.nullable
+                    , isList = listFlag
+                    , isOmit = False
+                    }
+
+            Nothing ->
+                case Dict.get name typed of
+
+                    Just info ->
+                        Ok
+                            { field = field
+                            , skyType = info.skyType
+                            , nullable = applyForceNull force info.nullable
+                            , isList = listFlag
+                            , isOmit = False
+                            }
+
+                    Nothing ->
+                        Err
+                            (Error.invalidInput
+                                ("cannot infer type for parameter @" ++ name
+                                    ++ " (not adjacent to a catalog column; add `-- @param "
+                                    ++ name
+                                    ++ " <Type>`)"))
+
+
+applyForceNull : Force -> Bool -> Bool
+applyForceNull force base =
+    case force of
+
+        FNotNull ->
+            False
+
+        FNull ->
+            True
+
+        FNone ->
+            base
+-- Reuse the table Model iff projection == full table in declared order,
+-- all plain columns, no alias, no force.
+
+
+directiveMap : List Directive -> Dict String TypeSpec
+directiveMap dirs =
+    Dict.fromList (List.filterMap paramPair dirs)
+
+
+paramPair : Directive -> Maybe ( String, TypeSpec )
+paramPair d =
+    case d of
+
+        DParam name spec ->
+            Just ( name, idTypeSpec spec )
+
+        _ ->
+            Nothing
+
+
+idTypeSpec : TypeSpec -> TypeSpec
+idTypeSpec s =
+    s
+-- Table the statement targets (for adjacency lookups)
+
+
+stmtTable : ParsedStmt -> String
+stmtTable parsed =
+    case parsed of
+
+        PSelect s ->
+            selectFromTable s
+
+        PUpdate u ->
+            updateTable u
+
+        PDelete d ->
+            deleteTable d
+
+        PInsert i ->
+            insertTable i
+
+        PCreate c ->
+            createName c
+
+
+selectFromTable : SelectStmt -> String
+selectFromTable s =
+    s.fromTable
+
+
+updateTable : UpdateStmt -> String
+updateTable u =
+    u.table
+
+
+deleteTable : DeleteStmt -> String
+deleteTable d =
+    d.table
+
+
+insertTable : InsertStmt -> String
+insertTable i =
+    i.table
+
+
+createName : CreateTable -> String
+createName c =
+    c.name
+-- INSERT: positional param -> column mapping
+
+
+insertParamTyping : Catalog -> InsertStmt -> List String -> Result Error (Dict String ParamInfo)
+insertParamTyping cat ins distinct =
+    case Catalog.lookup ins.table cat of
+
+        Nothing ->
+            Err (Error.invalidInput ("unknown table in INSERT: " ++ ins.table))
+
+        Just table ->
+            if List.length distinct /= List.length ins.columns then
+                Err
+                    (Error.invalidInput
+                        "INSERT param count does not match column count (v1 requires one @param per column, in order)")
+
+            else
+                zipInsert table ins.columns distinct Dict.empty
+
+
+zipInsert : CatTable -> List String -> List String -> Dict String ParamInfo -> Result Error (Dict String ParamInfo)
+zipInsert table cols names acc =
+    case ( cols, names ) of
+
+        ( [], [] ) ->
+            Ok acc
+
+        ( col :: colsRest, name :: namesRest ) ->
+            case findCol col table of
+
+                Just c ->
+                    zipInsert
+                        table
+                        colsRest
+                        namesRest
+                        (Dict.insert
+                            name
+                            { skyType = c.skyType, nullable = c.nullable }
+                            acc)
+
+                Nothing ->
+                    Err
+                        (Error.invalidInput ("unknown column in INSERT: " ++ col))
+
+        _ ->
+            Err (Error.invalidInput "INSERT column/param mismatch")
+
+
+findCol : String -> CatTable -> Maybe CatColumn
+findCol name table =
+    List.find (\c -> String.toLower c.name == String.toLower name) table.columns
+
+type alias AdjState =
+    { pending : Maybe CatColumn
+    , limitNext : Bool
+    , result : Dict String ParamInfo
+    }
+
+
+adjacencyTyping : Catalog -> String -> List Token -> Dict String ParamInfo
+adjacencyTyping cat tableName tokens =
+    case Catalog.lookup tableName cat of
+
+        Nothing ->
+            Dict.empty
+
+        Just table ->
+            (adjacencyGo
+                table
+                tokens
+                { pending = Nothing, limitNext = False, result = Dict.empty }).result
+
+
+adjacencyGo : CatTable -> List Token -> AdjState -> AdjState
+adjacencyGo table tokens st =
+    case tokens of
+
+        [] ->
+            st
+
+        t :: rest ->
+            adjacencyGo table rest (adjacencyStep table t st)
+
+
+adjacencyStep : CatTable -> Token -> AdjState -> AdjState
+adjacencyStep table t st =
+    case t of
+
+        TWord w ->
+            let
+                u = String.toUpper w
+            in
+                if u == "LIMIT" || u == "OFFSET" then
+                    { st | limitNext = True, pending = Nothing }
+
+                else
+                    case findCol w table of
+
+                        Just c ->
+                            { st | pending = Just c, limitNext = False }
+
+                        Nothing ->
+                            st
+
+        TParam name _ ->
+            let
+                info =
+                    if st.limitNext then
+                        Just { skyType = TInt, nullable = False }
+
+                    else
+                        case st.pending of
+
+                            Just c ->
+                                Just { skyType = c.skyType, nullable = False }
+
+                            Nothing ->
+                                Nothing
+                newResult =
+                    case info of
+
+                        Just i ->
+                            if Dict.member name st.result then
+                                st.result
+
+                            else
+                                Dict.insert name i st.result
+
+                        Nothing ->
+                            st.result
+            in
+                { st | result = newResult, limitNext = False }
+
+        _ ->
+            st
+
+type alias AdjState2 =
+    { pending : Maybe SkyType
+    , limitNext : Bool
+    , prevWord : Maybe String
+    , dotArmed : Bool
+    , result : Dict String ParamInfo
+    }
+
+
+adjScope : List ScopeEntry -> List Token -> Dict String ParamInfo
+adjScope scope tokens =
+    (adjFold
+        scope
+        tokens
+        { pending = Nothing
+        , limitNext = False
+        , prevWord = Nothing
+        , dotArmed = False
+        , result = Dict.empty
+        }).result
+
+
+adjFold : List ScopeEntry -> List Token -> AdjState2 -> AdjState2
+adjFold scope tokens st =
+    case tokens of
+
+        [] ->
+            st
+
+        t :: rest ->
+            adjFold scope rest (adjStepU scope t st)
+
+
+adjStepU : List ScopeEntry -> Token -> AdjState2 -> AdjState2
+adjStepU scope t st =
+    case t of
+
+        TWord w ->
+            if st.dotArmed then
+                case st.prevWord of
+
+                    Just q ->
+                        { st | pending = colTypeQual scope (Just q) w
+                        , dotArmed = False
+                        , prevWord = Nothing
+                        , limitNext = False
+                        }
+
+                    Nothing ->
+                        stepPlainWord scope w st
+
+            else
+                stepPlainWord scope w st
+
+        TSym s ->
+            if s == "." && st.prevWord /= Nothing then
+                { st | dotArmed = True }
+
+            else
+                { st | dotArmed = False, prevWord = Nothing }
+-- A bare (unqualified) word: a column sets `pending`; LIMIT/OFFSET arms the
+-- next param as Int; otherwise it's tracked as a potential qualifier/alias.
+
+        TParam name _ ->
+            stepParamU name st
+
+        _ ->
+            { st | dotArmed = False, prevWord = Nothing }
+
+
+stepPlainWord : List ScopeEntry -> String -> AdjState2 -> AdjState2
+stepPlainWord scope w st =
+    let
+        u = String.toUpper w
+    in
+        if u == "LIMIT" || u == "OFFSET" then
+            { st | limitNext = True
+            , pending = Nothing
+            , prevWord = Nothing
+            , dotArmed = False
+            }
+
+        else
+            case colTypeQual scope Nothing w of
+
+                Just ty ->
+                    { st | pending = Just ty
+                    , limitNext = False
+                    , prevWord = Just w
+                    , dotArmed = False
+                    }
+
+                Nothing ->
+                    { st | limitNext = False
+                    , prevWord = Just w
+                    , dotArmed = False
+                    }
+
+
+stepParamU : String -> AdjState2 -> AdjState2
+stepParamU name st =
+    let
+        info =
+            if st.limitNext then
+                Just { skyType = TInt, nullable = False }
+
+            else
+                case st.pending of
+
+                    Just ty ->
+                        Just { skyType = ty, nullable = False }
+
+                    Nothing ->
+                        Nothing
+        newResult =
+            case info of
+
+                Just i ->
+                    if Dict.member name st.result then
+                        st.result
+
+                    else
+                        Dict.insert name i st.result
+
+                Nothing ->
+                    st.result
+    in
+        { st | result = newResult
+        , limitNext = False
+        , prevWord = Nothing
+        , dotArmed = False
+        }
+
+
+colTypeQual : List ScopeEntry -> Maybe String -> String -> Maybe SkyType
+colTypeQual scope qualOpt name =
+    case findColumnInScope scope qualOpt name of
+
+        Ok m ->
+            Just m.col.skyType
+
+        Err _ ->
+            Nothing
+
+
+resolveResult : Catalog -> Prepared -> Result Error ResultShape
+resolveResult cat prep =
+    let
+        ret = stmtReturning prep.parsed
+    in
+        case prep.anno.card of
+
+            CExec ->
+                noResultOrReturningErr "exec" ret
+
+            CExecRows ->
+                noResultOrReturningErr "execrows" ret
+
+            _ ->
+                case prep.parsed of
+
+                    PSelect sel ->
+                        resolveSelectResult cat prep sel
+
+                    _ ->
+                        if List.isEmpty ret then
+                            Err
+                                (Error.invalidInput
+                                    ":one / :many / :scalar / :scalarmany require a SELECT statement or a RETURNING clause")
+
+                        else
+                            resolveReturningResult
+                                cat
+                                prep
+                                (stmtTable prep.parsed)
+                                ret
+-- The RETURNING projection of a statement (empty for SELECT / CREATE and for
+-- DML without a RETURNING clause).
+
+
+stmtReturning : ParsedStmt -> List SelectItem
+stmtReturning parsed =
+    case parsed of
+
+        PInsert i ->
+            insertReturning i
+
+        PUpdate u ->
+            updateReturning u
+
+        PDelete d ->
+            deleteReturning d
+
+        _ ->
+            []
+
+
+insertReturning : InsertStmt -> List SelectItem
+insertReturning i =
+    i.returning
+
+
+updateReturning : UpdateStmt -> List SelectItem
+updateReturning u =
+    u.returning
+
+
+deleteReturning : DeleteStmt -> List SelectItem
+deleteReturning d =
+    d.returning
+-- :exec / :execrows discard rows, so a RETURNING clause is a contradiction.
+
+
+noResultOrReturningErr : String -> List SelectItem -> Result Error ResultShape
+noResultOrReturningErr cardStr ret =
+    if List.isEmpty ret then
+        Ok NoResult
+
+    else
+        Err
+            (Error.invalidInput
+                ("a RETURNING clause requires :one / :many / :scalar / :scalarmany, not :"
+                    ++ cardStr))
+
+
+resolveSelectResult : Catalog -> Prepared -> SelectStmt -> Result Error ResultShape
+resolveSelectResult cat prep sel =
+    buildScope cat sel
+        |> Result.andThen
+               (\scope ->
+                   resolveProjection
+                       prep
+                       scope
+                       sel.items
+                       (not (List.isEmpty sel.joins)))
+-- RETURNING result: resolve the projection against a single-table scope for
+-- the DML target. No outer-join demotion (no joins on a RETURNING clause).
+
+
+resolveReturningResult : Catalog -> Prepared -> String -> List SelectItem -> Result Error ResultShape
+resolveReturningResult cat prep table items =
+    resolveTableEntry cat table Nothing
+        |> Result.andThen
+               (\rawE ->
+                   let
+                       scope =
+                           [{ aliasKey = rawE.aliasKey
+                           , nameKey = rawE.nameKey
+                           , table = rawE.table
+                           , demoted = False
+                           , suppressedCols = []
+                           }]
+                   in
+                       resolveProjection prep scope items False)
+-- Shared projection -> ResultShape: resolve columns, check collisions, pick
+-- shape (used by SELECT and by RETURNING).
+
+
+resolveProjection : Prepared -> List ScopeEntry -> List SelectItem -> Bool -> Result Error ResultShape
+resolveProjection prep scope items hasJoins =
+    let
+        nullableOv = overrideNames prep.anno.directives True
+        notnullOv = overrideNames prep.anno.directives False
+    in
+        resolveScopeColumns scope items nullableOv notnullOv []
+            |> Result.andThen
+                   (\cols ->
+                       checkColumnCollisions cols []
+                           |> Result.andThen
+                                  (\_ ->
+                                      shapeForCard
+                                          prep
+                                          items
+                                          hasJoins
+                                          scope
+                                          cols))
+-- Card-aware shape selection. :scalar/:scalarmany unwrap a single projected
+-- column to a bare value; everything else routes through shapeFor.
+
+
+shapeForCard : Prepared -> List SelectItem -> Bool -> List ScopeEntry -> List ResolvedColumn -> Result Error ResultShape
+shapeForCard prep items hasJoins scope cols =
+    case prep.anno.card of
+
+        CScalar ->
+            scalarShape cols
+
+        CScalarMany ->
+            scalarShape cols
+
+        _ ->
+            Ok (shapeFor prep items hasJoins scope cols)
+
+
+scalarShape : List ResolvedColumn -> Result Error ResultShape
+scalarShape cols =
+    case cols of
+
+        [c] ->
+            Ok (ScalarType c)
+
+        _ ->
+            Err
+                (Error.invalidInput
+                    ("`:scalar`/`:scalarmany` requires exactly one result column (got "
+                        ++ String.fromInt (List.length cols)
+                        ++ ")"))
+-- A JOIN result always emits a Row. A single-table full-projection reuses
+-- the table Model.
+
+
+shapeFor : Prepared -> List SelectItem -> Bool -> List ScopeEntry -> List ResolvedColumn -> ResultShape
+shapeFor prep items hasJoins scope cols =
+    case scope of
+
+        [only] ->
+            if not hasJoins && only.table.modelName /= ""
+                && reusesModel items only.table then
+                ReuseModel only.table.modelName only.table.decoderName
+
+            else
+                rowShape prep cols
+
+        _ ->
+            rowShape prep cols
+
+
+rowShape : Prepared -> List ResolvedColumn -> ResultShape
+rowShape prep cols =
+    let
+        rowType = prep.anno.name ++ "Row"
+        rowDecoder = Naming.fnName prep.anno.name ++ "RowDecoder"
+    in
+        RowType rowType rowDecoder cols
+-- Two projected columns with the same output field name clobber the result
+-- dict; require an `AS` alias.
+
+
+checkColumnCollisions : List ResolvedColumn -> List String -> Result Error ()
+checkColumnCollisions cols seen =
+    case cols of
+
+        [] ->
+            Ok ()
+
+        c :: rest ->
+            if List.member c.field seen then
+                Err
+                    (Error.invalidInput
+                        ("duplicate output column '" ++ c.column
+                            ++ "'; disambiguate with an AS alias"))
+
+            else
+                checkColumnCollisions rest (c.field :: seen)
+
+
+overrideNames : List Directive -> Bool -> List String
+overrideNames dirs wantNullable =
+    List.filterMap
+        (\d ->
+            case d of
+
+                DNullable n ->
+                    if wantNullable then
+                        Just n
+
+                    else
+                        Nothing
+
+                DNotNull n ->
+                    if wantNullable then
+                        Nothing
+
+                    else
+                        Just n
+
+                _ ->
+                    Nothing)
+        dirs
+
+type alias ScopeEntry =
+    { aliasKey : Maybe String
+    , nameKey : String
+    , table : CatTable
+    , demoted : Bool
+    , suppressedCols : List String
+    }
+
+type alias RawEntry =
+    { aliasKey : Maybe String
+    , nameKey : String
+    , table : CatTable
+    }
+
+type alias ColMatch =
+    { entry : ScopeEntry
+    , col : CatColumn
+    }
+
+
+buildScope : Catalog -> SelectStmt -> Result Error (List ScopeEntry)
+buildScope cat sel =
+    resolveFromEntry cat sel
+        |> Result.andThen
+               (\fromE ->
+                   resolveJoinEntries cat sel.joins []
+                       |> Result.map
+                              (\joinEs ->
+                                  let
+                                      raws = fromE :: joinEs
+                                      analysis = analyzeJoins sel.joins
+                                  in
+                                      List.indexedMap
+                                          (\i r ->
+                                              { aliasKey = r.aliasKey
+                                              , nameKey = r.nameKey
+                                              , table = r.table
+                                              , demoted = isDemoted analysis i
+                                              , suppressedCols = suppressedAt sel.joins i
+                                              })
+-- Recursively resolve the subquery's output columns (reusing the SELECT
+-- projection + nullability inference), then convert them to catalog columns.
+                                          raws))
+-- The FROM entry: a catalog table or a derived-table subquery synthesised into
+-- a virtual CatTable (empty modelName marks it synthetic -> never reuses a Model).
+-- Re-parse a derived table's captured inner tokens into a SELECT. Destructured
+-- in two steps + an annotated helper to avoid the constructor-pattern HM gap
+-- (§4.4) on a nested `Ok (PSelect sub)`.
+
+
+parseSubSelect : List Token -> Result Error SelectStmt
+parseSubSelect tokens =
+    case Parser.parseStatement tokens of
+
+        Ok p ->
+            selectFromParsed p
+
+        Err e ->
+            Err e
+
+
+selectFromParsed : ParsedStmt -> Result Error SelectStmt
+selectFromParsed p =
+    case p of
+
+        PSelect sub ->
+            okSelect sub
+
+        _ ->
+            Err
+                (Error.invalidInput
+                    "a derived-table source must be a SELECT subquery")
+
+
+okSelect : SelectStmt -> Result Error SelectStmt
+okSelect s =
+    Ok s
+
+
+resolveFromEntry : Catalog -> SelectStmt -> Result Error RawEntry
+resolveFromEntry cat sel =
+    if List.isEmpty sel.fromSubTokens then
+        resolveTableEntry cat sel.fromTable sel.fromAlias
+
+    else
+        parseSubSelect sel.fromSubTokens
+            |> Result.andThen (\sub -> deriveEntry cat sub sel.fromTable)
+
+
+deriveEntry : Catalog -> SelectStmt -> String -> Result Error RawEntry
+deriveEntry cat sub aliasStr =
+    deriveColumns cat sub
+        |> Result.map
+               (\cols ->
+                   { aliasKey = Just (String.toLower aliasStr)
+                   , nameKey = String.toLower aliasStr
+                   , table = { name = aliasStr
+                     , modelName = ""
+                     , decoderName = ""
+                     , columns = cols
+                     }
+                   })
+
+
+deriveColumns : Catalog -> SelectStmt -> Result Error (List CatColumn)
+deriveColumns cat sub =
+    buildScope cat sub
+        |> Result.andThen
+               (\subScope ->
+                   resolveScopeColumns subScope sub.items [] [] []
+                       |> Result.andThen
+                              (\rcols ->
+                                  checkColumnCollisions rcols []
+                                      |> Result.map
+                                             (\_ -> List.map toCatCol rcols)))
+
+
+toCatCol : ResolvedColumn -> CatColumn
+toCatCol c =
+    { name = c.column
+    , skyType = c.skyType
+    , nullable = c.nullable
+    , isPrimaryKey = False
+    , unique = False
+    , hasDefault = False
+    }
+
+
+buildParamScope : Catalog -> SelectStmt -> List ScopeEntry -> Result Error (List ScopeEntry)
+buildParamScope cat sel outerScope =
+    if List.isEmpty sel.fromSubTokens then
+        Ok outerScope
+
+    else
+        parseSubSelect sel.fromSubTokens
+            |> Result.andThen
+                   (\sub ->
+                       buildScope cat sub
+                           |> Result.map
+                                  (\innerScope ->
+                                      List.append outerScope innerScope))
+-- The k-th join's table (entry index k+1) suppresses its USING columns in
+-- `*` expansion and bare-column resolution: the shared column is provided once
+-- by the left side. The FROM entry (index 0) suppresses nothing.
+
+
+suppressedAt : List Join -> Int -> List String
+suppressedAt joins i =
+    if i == 0 then
+        []
+
+    else
+        case joinAt joins (i - 1) of
+
+            Just j ->
+                List.map String.toLower j.usingCols
+
+            Nothing ->
+                []
+
+
+joinAt : List Join -> Int -> Maybe Join
+joinAt joins n =
+    case joins of
+
+        [] ->
+            Nothing
+
+        j :: rest ->
+            if n == 0 then
+                Just j
+
+            else
+                joinAt rest (n - 1)
+
+
+resolveTableEntry : Catalog -> String -> Maybe String -> Result Error RawEntry
+resolveTableEntry cat tableName aliasOpt =
+    case Catalog.lookup tableName cat of
+
+        Nothing ->
+            Err (Error.invalidInput ("unknown table: " ++ tableName))
+
+        Just t ->
+            Ok
+                { aliasKey = lowerMaybe aliasOpt
+                , nameKey = String.toLower tableName
+                , table = t
+                }
+
+
+resolveJoinEntries : Catalog -> List Join -> List RawEntry -> Result Error (List RawEntry)
+resolveJoinEntries cat joins acc =
+    case joins of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        j :: rest ->
+            case resolveTableEntry cat j.table j.aliasName of
+
+                Err e ->
+                    Err e
+
+                Ok e ->
+                    resolveJoinEntries cat rest (e :: acc)
+
+
+lowerMaybe : Maybe String -> Maybe String
+lowerMaybe m =
+    case m of
+
+        Just s ->
+            Just (String.toLower s)
+
+        Nothing ->
+            Nothing
+
+type alias JoinAnalysis =
+    { hasLeftDemote : Bool
+    , maxLeftIdx : Int
+    , rightIdxs : List String
+    }
+
+
+analyzeJoins : List Join -> JoinAnalysis
+analyzeJoins joins =
+    analyzeGo joins 0 { hasLeftDemote = False, maxLeftIdx = -1, rightIdxs = [] }
+
+
+analyzeGo : List Join -> Int -> JoinAnalysis -> JoinAnalysis
+analyzeGo joins k st =
+    case joins of
+
+        [] ->
+            st
+
+        j :: rest ->
+            let
+                rightIdx = k + 1
+                st2 =
+                    if j.kind == JLeft || j.kind == JFull then
+                        { st | rightIdxs = String.fromInt rightIdx :: st.rightIdxs
+                        }
+
+                    else
+                        st
+                st3 =
+                    if j.kind == JRight || j.kind == JFull then
+                        { st2 | hasLeftDemote = True, maxLeftIdx = k }
+
+                    else
+                        st2
+            in
+                analyzeGo rest (k + 1) st3
+
+
+isDemoted : JoinAnalysis -> Int -> Bool
+isDemoted analysis i =
+    (analysis.hasLeftDemote && i <= analysis.maxLeftIdx)
+        || List.member (String.fromInt i) analysis.rightIdxs
+-- ===========================================================================
+-- Scope column resolution
+-- ===========================================================================
+
+
+resolveScopeColumns : List ScopeEntry -> List SelectItem -> List String -> List String -> List ResolvedColumn -> Result Error (List ResolvedColumn)
+resolveScopeColumns scope items nullableOv notnullOv acc =
+    case items of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        item :: rest ->
+            case resolveScopeItem scope item nullableOv notnullOv of
+
+                Err e ->
+                    Err e
+
+                Ok cols ->
+                    resolveScopeColumns
+                        scope
+                        rest
+                        nullableOv
+                        notnullOv
+                        (List.append (List.reverse cols) acc)
+
+
+resolveScopeItem : List ScopeEntry -> SelectItem -> List String -> List String -> Result Error (List ResolvedColumn)
+resolveScopeItem scope item nullableOv notnullOv =
+    case item of
+
+        SiStar Nothing ->
+            Ok (List.concatMap (\e -> expandTable e nullableOv notnullOv) scope)
+
+        SiStar (Just q) ->
+            case findScopeByQual q scope of
+
+                Just e ->
+                    Ok (expandTable e nullableOv notnullOv)
+
+                Nothing ->
+                    Err
+                        (Error.invalidInput
+                            ("unknown table or alias '" ++ q ++ "' in " ++ q
+                                ++ ".*"))
+
+        SiCol qualOpt col aliasOpt force ->
+            findColumnInScope scope qualOpt col
+                |> Result.map
+                       (\m ->
+                           let
+                               outName = outNameOf col aliasOpt
+                               baseNull =
+                                   applyForceNull
+                                       force
+                                       (m.col.nullable || m.entry.demoted)
+                           in
+                               [{ field = Naming.fieldName outName
+                               , column = outName
+                               , skyType = m.col.skyType
+                               , nullable = applyOverrides
+                                     outName
+                                     baseNull
+                                     nullableOv
+                                     notnullOv
+                               }])
+
+        SiAgg aggFn arg aliasName force ->
+            inferAgg scope aggFn arg aliasName force nullableOv notnullOv
+
+        SiCoalesce inner _ aliasName force ->
+            inferCoalesce scope inner aliasName force nullableOv notnullOv
+-- ---------------------------------------------------------------------------
+-- Aggregate / COALESCE nullability + base-type inference (DESIGN §4.5.3-5)
+--   COUNT(*|col)        -> Int,   non-null (always a row; 0 over empty)
+--   SUM(col)            -> base,  nullable (NULL over empty); base ∈ Int/Float
+--   AVG(col)            -> Float, nullable (SQLite avg is REAL)
+--   MIN/MAX(col)        -> base,  nullable; base ∈ Int/Float/String
+--   TOTAL(col)          -> Float, non-null (SQLite total returns 0.0 over empty)
+--   COALESCE(inner,lit) -> base of inner, non-null (literal guarantees a value)
+-- Per-column AS "c!"/"c?" force + @notnull/@nullable overrides still win.
+-- ---------------------------------------------------------------------------
+
+
+inferAgg : List ScopeEntry -> AggFunc -> AggArg -> String -> Force -> List String -> List String -> Result Error (List ResolvedColumn)
+inferAgg scope aggFn arg aliasName force nullableOv notnullOv =
+    case aggFn of
+
+        AggCount ->
+            Ok [mkAggCol aliasName TInt False force nullableOv notnullOv]
+
+        AggAvg ->
+            aggArgNumeric scope aggFn arg
+                |> Result.map
+                       (\_ ->
+                           [mkAggCol
+                               aliasName
+                               TFloat
+                               True
+                               force
+                               nullableOv
+                               notnullOv])
+
+        AggSum ->
+            aggArgNumeric scope aggFn arg
+                |> Result.map
+                       (\base ->
+                           [mkAggCol
+                               aliasName
+                               base
+                               True
+                               force
+                               nullableOv
+                               notnullOv])
+
+        AggTotal ->
+            aggArgNumeric scope aggFn arg
+                |> Result.map
+                       (\_ ->
+                           [mkAggCol
+                               aliasName
+                               TFloat
+                               False
+                               force
+                               nullableOv
+                               notnullOv])
+
+        AggMin ->
+            aggArgOrderable scope aggFn arg
+                |> Result.map
+                       (\base ->
+                           [mkAggCol
+                               aliasName
+                               base
+                               True
+                               force
+                               nullableOv
+                               notnullOv])
+
+        AggMax ->
+            aggArgOrderable scope aggFn arg
+                |> Result.map
+                       (\base ->
+                           [mkAggCol
+                               aliasName
+                               base
+                               True
+                               force
+                               nullableOv
+                               notnullOv])
+
+
+inferCoalesce : List ScopeEntry -> CoalesceInner -> String -> Force -> List String -> List String -> Result Error (List ResolvedColumn)
+inferCoalesce scope inner aliasName force nullableOv notnullOv =
+    coalesceInnerType scope inner
+        |> Result.map
+               (\base ->
+                   [mkAggCol aliasName base False force nullableOv notnullOv])
+
+
+coalesceInnerType : List ScopeEntry -> CoalesceInner -> Result Error SkyType
+coalesceInnerType scope inner =
+    case inner of
+
+        CiAgg aggFn arg ->
+            case aggFn of
+
+                AggCount ->
+                    Ok TInt
+
+                AggAvg ->
+                    aggArgNumeric scope aggFn arg |> Result.map (\_ -> TFloat)
+
+                AggSum ->
+                    aggArgNumeric scope aggFn arg
+
+                AggTotal ->
+                    aggArgNumeric scope aggFn arg |> Result.map (\_ -> TFloat)
+
+                AggMin ->
+                    aggArgOrderable scope aggFn arg
+
+                AggMax ->
+                    aggArgOrderable scope aggFn arg
+
+        CiCol qualOpt col ->
+            findColumnInScope scope qualOpt col
+                |> Result.map (\m -> m.col.skyType)
+
+
+mkAggCol : String -> SkyType -> Bool -> Force -> List String -> List String -> ResolvedColumn
+mkAggCol aliasName base nullable force nullableOv notnullOv =
+    let
+        baseNull = applyForceNull force nullable
+    in
+        { field = Naming.fieldName aliasName
+        , column = aliasName
+        , skyType = base
+        , nullable = applyOverrides aliasName baseNull nullableOv notnullOv
+        }
+
+
+aggColType : List ScopeEntry -> AggArg -> Result Error SkyType
+aggColType scope arg =
+    case arg of
+
+        AggStar ->
+            Err
+                (Error.invalidInput
+                    "this aggregate requires a column argument, not *")
+
+        AggCol qualOpt col ->
+            findColumnInScope scope qualOpt col
+                |> Result.map (\m -> m.col.skyType)
+
+
+aggArgNumeric : List ScopeEntry -> AggFunc -> AggArg -> Result Error SkyType
+aggArgNumeric scope aggFn arg =
+    aggColType scope arg
+        |> Result.andThen
+               (\base ->
+                   if base == TInt || base == TFloat then
+                       Ok base
+
+                   else
+                       Err
+                           (Error.invalidInput
+                               (aggName aggFn
+                                   ++ "(...) requires a numeric column (Int/Float); column has type "
+                                   ++ skyTypeName base)))
+
+
+aggArgOrderable : List ScopeEntry -> AggFunc -> AggArg -> Result Error SkyType
+aggArgOrderable scope aggFn arg =
+    aggColType scope arg
+        |> Result.andThen
+               (\base ->
+                   if base == TInt || base == TFloat || base == TString then
+                       Ok base
+
+                   else
+                       Err
+                           (Error.invalidInput
+                               (aggName aggFn ++ "(...) over a "
+                                   ++ skyTypeName base
+                                   ++ " column is not supported (aggregate decode would be lossy); restrict to Int/Float/String or annotate")))
+
+
+expandTable : ScopeEntry -> List String -> List String -> List ResolvedColumn
+expandTable e nullableOv notnullOv =
+    List.map
+        (\c ->
+            { field = Naming.fieldName c.name
+            , column = c.name
+            , skyType = c.skyType
+            , nullable = applyOverrides
+                  c.name
+                  (c.nullable || e.demoted)
+                  nullableOv
+                  notnullOv
+            })
+        (List.filter
+            (\c -> not (List.member (String.toLower c.name) e.suppressedCols))
+            e.table.columns)
+
+
+outNameOf : String -> Maybe String -> String
+outNameOf col aliasOpt =
+    case aliasOpt of
+
+        Just a ->
+            a
+
+        Nothing ->
+            col
+
+
+findScopeByQual : String -> List ScopeEntry -> Maybe ScopeEntry
+findScopeByQual q scope =
+    let
+        lq = String.toLower q
+    in
+        List.find (\e -> e.aliasKey == Just lq || e.nameKey == lq) scope
+
+
+findColumnInScope : List ScopeEntry -> Maybe String -> String -> Result Error ColMatch
+findColumnInScope scope qualOpt col =
+    case qualOpt of
+
+        Just q ->
+            case findScopeByQual q scope of
+
+                Nothing ->
+                    Err
+                        (Error.invalidInput
+                            ("unknown table or alias '" ++ q ++ "' in " ++ q
+                                ++ "."
+                                ++ col))
+
+                Just e ->
+                    case findCol col e.table of
+
+                        Just c ->
+                            Ok { entry = e, col = c }
+
+                        Nothing ->
+                            Err
+                                (Error.invalidInput
+                                    ("column '" ++ col
+                                        ++ "' not found in table '"
+                                        ++ e.table.name
+                                        ++ "'"))
+
+        Nothing ->
+            case matchesAcrossScope scope col [] of
+
+                [] ->
+                    Err (Error.invalidInput ("unknown column '" ++ col ++ "'"))
+
+                [m] ->
+                    Ok m
+
+                _ ->
+                    Err
+                        (Error.invalidInput
+                            ("ambiguous column '" ++ col ++ "'; qualify it (t."
+                                ++ col
+                                ++ ")"))
+
+
+matchesAcrossScope : List ScopeEntry -> String -> List ColMatch -> List ColMatch
+matchesAcrossScope scope col acc =
+    case scope of
+
+        [] ->
+            List.reverse acc
+
+        e :: rest ->
+            if List.member (String.toLower col) e.suppressedCols then
+                -- a USING-suppressed column is provided by the left side; don't
+                -- count this entry (so a bare USING column isn't "ambiguous")
+                matchesAcrossScope rest col acc
+
+            else
+                case findCol col e.table of
+
+                    Just c ->
+                        matchesAcrossScope
+                            rest
+                            col
+                            ({ entry = e, col = c } :: acc)
+
+                    Nothing ->
+                        matchesAcrossScope rest col acc
+
+
+applyOverrides : String -> Bool -> List String -> List String -> Bool
+applyOverrides name base nullableOv notnullOv =
+    if List.member name notnullOv then
+        False
+
+    else if List.member name nullableOv then
+        True
+
+    else
+        base
+
+
+reusesModel : List SelectItem -> CatTable -> Bool
+reusesModel items table =
+    case items of
+
+        [SiStar Nothing] ->
+            True
+
+        _ ->
+            plainColNames items == Just (List.map (\c -> c.name) table.columns)
+
+
+plainColNames : List SelectItem -> Maybe (List String)
+plainColNames items =
+    plainColNamesGo items []
+
+
+plainColNamesGo : List SelectItem -> List String -> Maybe (List String)
+plainColNamesGo items acc =
+    case items of
+
+        [] ->
+            Just (List.reverse acc)
+
+        (SiCol _ col (Nothing FNone)) :: rest ->
+            plainColNamesGo rest (col :: acc)
+
+        _ ->
+            Nothing
+
+
+rewritePlaceholders : Dialect -> String -> String
+rewritePlaceholders dialect sql =
+    let
+        final =
+            rewriteGo
+                dialect
+                (String.toList sql)
+                { out = [], counter = 0, seen = Dict.empty }
+    in
+        String.fromList (List.reverse final.out)
+
+type alias RewriteState =
+    { out : List Char
+    , counter : Int
+    , seen : Dict String Int
+    }
+
+
+rewriteGo : Dialect -> List Char -> RewriteState -> RewriteState
+rewriteGo dialect chars st =
+    case chars of
+
+        [] ->
+            st
+
+        '@' :: rest ->
+            let
+                ( name, rem1 ) = spanIdent rest []
+                rem2 = dropForceChar rem1
+                ( placeholder, st2 ) = placeholderFor dialect name st
+            in
+                rewriteGo
+                    dialect
+                    rem2
+                    { st2 | out = List.append
+                          (List.reverse (String.toList placeholder))
+                          st2.out
+                    }
+
+        c :: rest ->
+            rewriteGo dialect rest { st | out = c :: st.out }
+
+
+spanIdent : List Char -> List Char -> ( String, List Char )
+spanIdent chars acc =
+    case chars of
+
+        c :: rest ->
+            if isIdentCharR c then
+                spanIdent rest (c :: acc)
+
+            else
+                ( String.fromList (List.reverse acc), chars )
+
+        [] ->
+            ( String.fromList (List.reverse acc), [] )
+
+
+isIdentCharR : Char -> Bool
+isIdentCharR c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+        || c
+        == '_'
+
+
+dropForceChar : List Char -> List Char
+dropForceChar chars =
+    case chars of
+
+        '!' :: rest ->
+            rest
+
+        '?' :: rest ->
+            rest
+
+        _ ->
+            chars
+
+
+placeholderFor : Dialect -> String -> RewriteState -> ( String, RewriteState )
+placeholderFor dialect name st =
+    case dialect of
+
+        DSqlite ->
+            ( "?", st )
+
+        DPostgres ->
+            case Dict.get name st.seen of
+
+                Just n ->
+                    ( "$" ++ String.fromInt n, st )
+
+                Nothing ->
+                    let
+                        n = st.counter + 1
+                    in
+                        ( "$" ++ String.fromInt n
+                        , { st | counter = n
+                          , seen = Dict.insert name n st.seen
+                          }
+                        )

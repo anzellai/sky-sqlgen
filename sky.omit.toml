@@ -1,0 +1,10 @@
+# Standalone config for the DEFAULT-omittable INSERT example (sql/omit.sql).
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/omit.sql"]
+queries     = ["sql/omit.sql"]
+out         = "src/GenOmit"
+module      = "GenOmit"
+singularize = true
+verify      = true

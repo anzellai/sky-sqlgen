@@ -1,0 +1,10 @@
+# Standalone config for the derived-table example (sql/derived.sql).
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/derived.sql"]
+queries     = ["sql/derived.sql"]
+out         = "src/GenDerived"
+module      = "GenDerived"
+singularize = true
+verify      = true

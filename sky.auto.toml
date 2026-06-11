@@ -1,0 +1,13 @@
+# Standalone config for the auto-naming + skip-and-warn demo (sql/auto.sql).
+# Not a single statement in auto.sql carries a `-- name:` annotation — names
+# are content-derived from the catalog. The trailing CTE is skipped with a
+# warning while the rest still generate.
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/auto.sql"]
+queries     = ["sql/auto.sql"]
+out         = "src/GenAuto"
+module      = "GenAuto"
+singularize = true
+verify      = true

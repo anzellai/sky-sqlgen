@@ -1,0 +1,14 @@
+# Standalone config for the billing example (sql/billing.sql).
+# Demonstrates lossless Decimal/Money currency mapping. Kept separate from
+# sky.toml because billing.sql declares its own tables and we want the default
+# run (users.sql) to stay byte-identical.
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/billing.sql"]
+queries     = ["sql/billing.sql"]
+out         = "src/GenBilling"
+module      = "GenBilling"
+singularize = true
+verify      = true
+decimal_as  = "decimal"           # "decimal" (default, lossless) | "float" | "money"

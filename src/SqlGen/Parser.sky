@@ -1,0 +1,1514 @@
+module SqlGen.Parser exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+
+
+-- ===========================================================================
+-- Token helpers
+-- ===========================================================================
+wordOf : Token -> Maybe String
+wordOf t =
+    case t of
+
+        TWord w ->
+            Just w
+
+        _ ->
+            Nothing
+-- Skip an ON <condition> up to the next join / clause keyword.
+
+
+eqWord : String -> String -> Bool
+eqWord a b =
+    String.toUpper a == String.toUpper b
+
+
+keywordIs : String -> Token -> Bool
+keywordIs kw t =
+    case t of
+
+        TWord w ->
+            eqWord w kw
+
+        _ ->
+            False
+-- ===========================================================================
+-- Top-level dispatch
+-- ===========================================================================
+
+
+isSym : String -> Token -> Bool
+isSym s t =
+    case t of
+
+        TSym x ->
+            x == s
+
+        _ ->
+            False
+-- ===========================================================================
+-- Paren / comma utilities
+-- ===========================================================================
+
+
+-- Given tokens starting at "(", return (innerTokens, tokensAfterClosingParen).
+
+
+parseStatement : List Token -> Result Error ParsedStmt
+parseStatement tokens =
+    case tokens of
+
+        first :: _ ->
+            case wordOf first of
+
+                Just w ->
+                    let
+                        kw = String.toUpper w
+                    in
+                        if kw == "CREATE" then
+                            parseCreate tokens
+
+                        else if kw == "SELECT" then
+                            parseSelect tokens
+
+                        else if kw == "INSERT" then
+                            parseInsert tokens
+
+                        else if kw == "UPDATE" then
+                            parseUpdate tokens
+
+                        else if kw == "DELETE" then
+                            parseDelete tokens
+
+                        else
+                            Err
+                                (Error.invalidInput
+                                    ("unsupported statement starting with: " ++ w))
+
+                Nothing ->
+                    Err
+                        (Error.invalidInput
+                            "statement does not begin with a keyword")
+
+        [] ->
+            Err (Error.invalidInput "empty statement")
+
+
+isDdl : List Token -> Bool
+isDdl tokens =
+    case tokens of
+
+        first :: _ ->
+            case wordOf first of
+
+                Just w ->
+                    eqWord w "CREATE" || eqWord w "ALTER" || eqWord w "DROP"
+
+                Nothing ->
+                    False
+-- A single (possibly qualified) column reference.  Uses variable-bind list
+-- steps; the nested-cons lowering bug that originally motivated this
+-- (IMPL-PUSHBACK §7.6) was fixed upstream in #583 — style kept for clarity.
+
+        [] ->
+            False
+
+
+betweenParens : List Token -> Result Error ( List Token, List Token )
+betweenParens tokens =
+    case tokens of
+
+        t :: rest ->
+            if isSym "(" t then
+                grabParen rest 0 []
+
+            else
+                Err (Error.invalidInput "expected '('")
+
+        [] ->
+            Err (Error.invalidInput "expected '(' but ran out of tokens")
+
+
+grabParen : List Token -> Int -> List Token -> Result Error ( List Token, List Token )
+grabParen tokens depth acc =
+    case tokens of
+
+        [] ->
+            Err (Error.invalidInput "unbalanced parentheses")
+
+        t :: rest ->
+            if isSym "(" t then
+                grabParen rest (depth + 1) (t :: acc)
+
+            else if isSym ")" t then
+                if depth == 0 then
+                    Ok ( List.reverse acc, rest )
+
+                else
+                    grabParen rest (depth - 1) (t :: acc)
+
+            else
+                grabParen rest depth (t :: acc)
+-- Split a token list on top-level commas (paren depth 0).
+
+
+splitCommas : List Token -> List (List Token)
+splitCommas tokens =
+    splitCommasGo tokens 0 [] []
+
+
+splitCommasGo : List Token -> Int -> List Token -> List (List Token) -> List (List Token)
+splitCommasGo tokens depth cur acc =
+    case tokens of
+
+        [] ->
+            List.reverse (pushCur cur acc)
+
+        t :: rest ->
+            if isSym "(" t then
+                splitCommasGo rest (depth + 1) (t :: cur) acc
+
+            else if isSym ")" t then
+                splitCommasGo rest (depth - 1) (t :: cur) acc
+
+            else if isSym "," t && depth == 0 then
+                splitCommasGo rest depth [] (pushCur cur acc)
+
+            else
+                splitCommasGo rest depth (t :: cur) acc
+
+
+pushCur : List Token -> List (List Token) -> List (List Token)
+pushCur cur acc =
+    if List.isEmpty cur then
+        acc
+
+    else
+        List.reverse cur :: acc
+-- take tokens up to (exclusive) the first top-level token matching pred
+
+
+takeUntil : (Token -> Bool) -> List Token -> ( List Token, List Token )
+takeUntil pred tokens =
+    takeUntilGo pred tokens 0 []
+
+
+takeUntilGo : (Token -> Bool) -> List Token -> Int -> List Token -> ( List Token, List Token )
+takeUntilGo pred tokens depth acc =
+    case tokens of
+
+        [] ->
+            ( List.reverse acc, [] )
+
+        t :: rest ->
+            if isSym "(" t then
+                takeUntilGo pred rest (depth + 1) (t :: acc)
+
+            else if isSym ")" t then
+                takeUntilGo pred rest (depth - 1) (t :: acc)
+
+            else if depth == 0 && pred t then
+                ( List.reverse acc, tokens )
+
+            else
+                takeUntilGo pred rest depth (t :: acc)
+-- ===========================================================================
+-- CREATE TABLE
+-- ===========================================================================
+
+
+parseCreate : List Token -> Result Error ParsedStmt
+parseCreate tokens =
+    -- drop CREATE TABLE [IF NOT EXISTS]
+    case dropCreateHead tokens of
+
+        Err e ->
+            Err e
+
+        Ok ( tableName, afterName ) ->
+            case betweenParens afterName of
+
+                Err e ->
+                    Err e
+
+                Ok ( inner, _ ) ->
+                    parseColumnSections (splitCommas inner) [] [] []
+                        |> Result.map
+                               (\sections ->
+                                   PCreate
+                                       { name = tableName
+                                       , columns = sections.columns
+                                       , pkCols = sections.pkCols
+                                       , uniqueCols = sections.uniqueCols
+                                       })
+
+
+dropCreateHead : List Token -> Result Error ( String, List Token )
+dropCreateHead tokens =
+    case tokens of
+
+        c :: t :: rest ->
+            if eqTokWord c "CREATE" && eqTokWord t "TABLE" then
+                skipIfNotExists rest
+
+            else
+                Err (Error.invalidInput "expected CREATE TABLE")
+
+        _ ->
+            Err (Error.invalidInput "truncated CREATE TABLE")
+
+
+eqTokWord : Token -> String -> Bool
+eqTokWord t kw =
+    case t of
+
+        TWord w ->
+            eqWord w kw
+
+        _ ->
+            False
+
+
+skipIfNotExists : List Token -> Result Error ( String, List Token )
+skipIfNotExists tokens =
+    case tokens of
+
+        a :: b :: c :: rest ->
+            if eqTokWord a "IF" && eqTokWord b "NOT" && eqTokWord c "EXISTS" then
+                takeTableName rest
+
+            else
+                takeTableName tokens
+
+        _ ->
+            takeTableName tokens
+
+
+takeTableName : List Token -> Result Error ( String, List Token )
+takeTableName tokens =
+    case tokens of
+
+        t :: rest ->
+            case wordOf t of
+
+                Just name ->
+                    Ok ( name, rest )
+
+                Nothing ->
+                    Err (Error.invalidInput "expected table name")
+
+        [] ->
+            Err (Error.invalidInput "expected table name")
+
+-- A FROM source: a catalog table or a derived-table subquery. For a subquery,
+-- `fromSubTokens` holds the inner SELECT's tokens (re-parsed in Infer);
+-- `table` is its (mandatory) alias.
+type alias ColumnSections =
+    { columns : List ParsedColumn
+    , pkCols : List String
+    , uniqueCols : List String
+    }
+-- Annotated accessors (constructor-pattern-bound records need a typed helper
+-- for field access, see IMPL-PUSHBACK §4).
+
+
+parseColumnSections : List (List Token) -> List ParsedColumn -> List String -> List String -> Result Error ColumnSections
+parseColumnSections sections cols pks uniques =
+    case sections of
+
+        [] ->
+            Ok
+                { columns = List.reverse cols
+                , pkCols = pks
+                , uniqueCols = uniques
+                }
+
+        section :: rest ->
+            if isTableConstraint section then
+                parseColumnSections
+                    rest
+                    cols
+                    (List.append pks (extractPkCols section))
+                    (List.append uniques (extractUniqueCols section))
+
+            else
+                case parseColumnDef section of
+
+                    Err e ->
+                        Err e
+
+                    Ok col ->
+                        parseColumnSections rest (col :: cols) pks uniques
+
+
+isTableConstraint : List Token -> Bool
+isTableConstraint section =
+    case section of
+
+        first :: _ ->
+            case wordOf first of
+
+                Just w ->
+                    let
+                        u = String.toUpper w
+                    in
+                        u == "PRIMARY" || u == "FOREIGN" || u == "UNIQUE" || u
+                            == "CHECK"
+                            || u
+                            == "CONSTRAINT"
+
+                Nothing ->
+                    False
+
+        [] ->
+            False
+
+
+extractPkCols : List Token -> List String
+extractPkCols section =
+    case section of
+
+        a :: b :: rest ->
+            if eqTokWord a "PRIMARY" && eqTokWord b "KEY" then
+                case betweenParens rest of
+
+                    Ok ( inner, _ ) ->
+                        List.filterMap wordOf inner
+
+                    Err _ ->
+                        []
+-- A table-level `UNIQUE ( col, ... )` constraint yields its column list.
+-- `CONSTRAINT name UNIQUE (...)` and composite uniques are tolerated (best
+-- effort — a composite UNIQUE still flags each member column as unique).
+
+            else
+                []
+
+        _ ->
+            []
+
+
+extractUniqueCols : List Token -> List String
+extractUniqueCols section =
+    case section of
+
+        a :: rest ->
+            if eqTokWord a "UNIQUE" then
+                case betweenParens rest of
+
+                    Ok ( inner, _ ) ->
+                        List.filterMap wordOf inner
+
+                    Err _ ->
+                        []
+
+            else
+                []
+
+        [] ->
+            []
+
+
+parseColumnDef : List Token -> Result Error ParsedColumn
+parseColumnDef section =
+    case section of
+
+        nameTok :: rest ->
+            case wordOf nameTok of
+
+                Just colName ->
+                    let
+                        ( typeToks, constraintToks ) =
+                            takeUntil isConstraintStarter rest
+                        typeWords = List.filterMap wordOf typeToks
+                        flags = scanConstraints constraintToks
+                    in
+                        Ok
+                            { name = colName
+                            , typeWords = typeWords
+                            , notNull = flags.notNull || flags.primaryKey
+                            , primaryKey = flags.primaryKey
+                            , unique = flags.unique
+                            , hasDefault = flags.hasDefault
+                            }
+
+                Nothing ->
+                    Err (Error.invalidInput "expected column name")
+
+        [] ->
+            Err (Error.invalidInput "empty column definition")
+
+
+isConstraintStarter : Token -> Bool
+isConstraintStarter t =
+    case t of
+
+        TWord w ->
+            let
+                u = String.toUpper w
+            in
+                u == "NOT" || u == "NULL" || u == "PRIMARY" || u == "UNIQUE"
+                    || u
+                    == "DEFAULT"
+                    || u
+                    == "REFERENCES"
+                    || u
+                    == "CHECK"
+                    || u
+                    == "AUTOINCREMENT"
+                    || u
+                    == "COLLATE"
+                    || u
+                    == "GENERATED"
+                    || u
+                    == "CONSTRAINT"
+
+        _ ->
+            False
+
+-- A parsed table reference: name, optional alias, and the leftover tokens.
+type alias ColFlags =
+    { notNull : Bool
+    , primaryKey : Bool
+    , unique : Bool
+    , hasDefault : Bool
+    }
+
+
+scanConstraints : List Token -> ColFlags
+scanConstraints tokens =
+    scanConstraintsGo
+        tokens
+        { notNull = False
+        , primaryKey = False
+        , unique = False
+        , hasDefault = False
+        }
+
+
+scanConstraintsGo : List Token -> ColFlags -> ColFlags
+scanConstraintsGo tokens flags =
+    case tokens of
+
+        [] ->
+            flags
+-- ===========================================================================
+-- SELECT
+-- ===========================================================================
+
+        a :: b :: rest ->
+            if eqTokWord a "NOT" && eqTokWord b "NULL" then
+                scanConstraintsGo rest { flags | notNull = True }
+
+            else if eqTokWord a "PRIMARY" && eqTokWord b "KEY" then
+                scanConstraintsGo rest { flags | primaryKey = True }
+
+            else
+                scanConstraintsGo (b :: rest) (applyFlag a flags)
+
+        a :: rest ->
+            scanConstraintsGo rest (applyFlag a flags)
+
+
+applyFlag : Token -> ColFlags -> ColFlags
+applyFlag t flags =
+    case t of
+
+        TWord w ->
+            let
+                u = String.toUpper w
+            in
+                if u == "UNIQUE" then
+                    { flags | unique = True }
+
+                else if u == "DEFAULT" then
+                    { flags | hasDefault = True }
+
+                else
+                    flags
+
+        _ ->
+            flags
+
+
+parseSelect : List Token -> Result Error ParsedStmt
+parseSelect tokens =
+    case tokens of
+
+        _ :: afterSelect ->
+            let
+                ( itemToks, afterItems ) =
+                    takeUntil (keywordIs "FROM") afterSelect
+            in
+                case afterItems of
+
+                    fromTok :: afterFrom ->
+                        if keywordIs "FROM" fromTok then
+                            parseFromSource afterFrom
+                                |> Result.andThen
+                                       (\fromRef ->
+                                           parseJoins fromRef.rest []
+                                               |> Result.andThen
+                                                      (\joins ->
+                                                          parseSelectItems
+                                                              (splitCommas
+                                                                  itemToks)
+                                                              []
+                                                              |> Result.map
+                                                                     (\items ->
+                                                                         PSelect
+                                                                             { items = items
+                                                                             , fromTable = fromRef.table
+                                                                             , fromAlias = fromRef.aliasName
+                                                                             , joins = joins
+                                                                             , fromSubTokens = fromRef.fromSubTokens
+                                                                             })))
+
+                        else
+                            Err (Error.invalidInput "expected FROM clause")
+
+                    _ ->
+                        Err (Error.invalidInput "SELECT requires a FROM clause")
+
+        [] ->
+            Err (Error.invalidInput "empty SELECT")
+
+-- The join condition after a joined table:
+--   USING ( col, ... )  -> capture the shared columns
+--   ON <expr>           -> skipped (kind alone drives demotion)
+--   (none)              -> CROSS JOIN / comma join
+type alias FromSource =
+    { table : String
+    , aliasName : Maybe String
+    , fromSubTokens : List Token
+    , rest : List Token
+    }
+
+
+parseFromSource : List Token -> Result Error FromSource
+parseFromSource tokens =
+    case tokens of
+
+        t :: _ ->
+            if isSym "(" t then
+                parseDerived tokens
+
+            else
+                parseTableRef tokens
+                    |> Result.map
+                           (\tr ->
+                               { table = tr.table
+                               , aliasName = tr.aliasName
+                               , fromSubTokens = []
+                               , rest = tr.rest
+                               })
+
+        [] ->
+            Err (Error.invalidInput "expected a FROM source")
+-- `( SELECT ... ) [AS] alias` — the alias is mandatory for a derived table.
+-- The inner tokens are captured raw and validated/resolved in Infer.
+
+
+parseDerived : List Token -> Result Error FromSource
+parseDerived tokens =
+    betweenParens tokens
+        |> Result.andThen
+               (\res ->
+                   let
+                       inner = fst res
+                       after = snd res
+                   in
+                       if List.isEmpty inner then
+                           Err
+                               (Error.invalidInput
+                                   "empty derived-table subquery: FROM ( ... )")
+
+                       else
+                           case parseOptAlias after of
+
+                               ( Just aliasStr, rest2 ) ->
+                                   Ok
+                                       { table = aliasStr
+                                       , aliasName = Just aliasStr
+                                       , fromSubTokens = inner
+                                       , rest = rest2
+                                       }
+
+                               ( Nothing, _ ) ->
+                                   Err
+                                       (Error.invalidInput
+                                           "a derived table (FROM (SELECT ...)) requires an alias, e.g. FROM (SELECT ...) AS sub"))
+
+type alias TableRef =
+    { table : String
+    , aliasName : Maybe String
+    , rest : List Token
+    }
+
+
+parseTableRef : List Token -> Result Error TableRef
+parseTableRef tokens =
+    case tokens of
+
+        tableTok :: rest ->
+            case wordOf tableTok of
+
+                Just table ->
+                    case parseOptAlias rest of
+
+                        ( aliasOpt, rest2 ) ->
+                            Ok
+                                { table = table
+                                , aliasName = aliasOpt
+                                , rest = rest2
+                                }
+
+                Nothing ->
+                    Err (Error.invalidInput "expected table name")
+
+        [] ->
+            Err (Error.invalidInput "expected table name after FROM/JOIN")
+-- Optional `[AS] alias` after a table name. A bare word that is a clause /
+-- join keyword is NOT an alias.
+
+
+parseOptAlias : List Token -> ( Maybe String, List Token )
+parseOptAlias tokens =
+    case tokens of
+
+        t :: rest ->
+            if keywordIs "AS" t then
+                case rest of
+
+                    a :: rest2 ->
+                        case wordOf a of
+
+                            Just name ->
+                                ( Just name, rest2 )
+
+                            Nothing ->
+                                ( Nothing, rest )
+
+                    [] ->
+                        ( Nothing, [] )
+
+            else
+                case wordOf t of
+
+                    Just w ->
+                        if isReservedAfterTable t then
+                            ( Nothing, tokens )
+
+                        else
+                            ( Just w, rest )
+
+                    Nothing ->
+                        ( Nothing, tokens )
+
+        [] ->
+            ( Nothing, [] )
+
+
+parseJoins : List Token -> List Join -> Result Error (List Join)
+parseJoins tokens acc =
+    case detectJoinKind tokens of
+
+        Just jk ->
+            parseTableRef (joinHeadRest jk)
+                |> Result.andThen
+                       (\tr ->
+                           let
+                               cond = parseJoinCondition tr.rest
+                           in
+                               parseJoins
+                                   cond.rest
+                                   ({ kind = joinHeadKind jk
+                                   , table = tr.table
+                                   , aliasName = tr.aliasName
+                                   , usingCols = cond.usingCols
+                                   }
+                                       :: acc))
+
+        Nothing ->
+            Ok (List.reverse acc)
+
+type alias JoinCond =
+    { usingCols : List String
+    , rest : List Token
+    }
+
+
+parseJoinCondition : List Token -> JoinCond
+parseJoinCondition tokens =
+    case tokens of
+
+        t :: rest ->
+            if keywordIs "USING" t then
+                case betweenParens rest of
+
+                    Ok ( inner, after ) ->
+                        { usingCols = List.filterMap wordOf inner
+                        , rest = after
+                        }
+
+                    Err _ ->
+                        { usingCols = [], rest = rest }
+
+            else if keywordIs "ON" t then
+                { usingCols = [], rest = skipOn tokens }
+
+            else
+                { usingCols = [], rest = tokens }
+
+        [] ->
+            { usingCols = [], rest = [] }
+
+type alias JoinHead =
+    { kind : JoinKind
+    , rest : List Token
+    }
+
+
+joinHeadKind : JoinHead -> JoinKind
+joinHeadKind jh =
+    jh.kind
+
+
+joinHeadRest : JoinHead -> List Token
+joinHeadRest jh =
+    jh.rest
+-- Recognise an optional leading join clause and its kind.
+
+
+detectJoinKind : List Token -> Maybe JoinHead
+detectJoinKind tokens =
+    case tokens of
+
+        a :: rest ->
+            let
+                u = upperWord a
+            in
+                if u == "JOIN" then
+                    Just { kind = JInner, rest = rest }
+
+                else if u == "INNER" then
+                    expectJoin rest JInner
+
+                else if u == "CROSS" then
+                    expectJoin rest JCross
+
+                else if u == "LEFT" then
+                    skipOuterThenJoin rest JLeft
+
+                else if u == "RIGHT" then
+                    skipOuterThenJoin rest JRight
+
+                else if u == "FULL" then
+                    skipOuterThenJoin rest JFull
+
+                else
+                    Nothing
+-- `*` only valid for count.
+
+        [] ->
+            Nothing
+-- ===========================================================================
+-- DELETE
+-- ===========================================================================
+
+
+skipOuterThenJoin : List Token -> JoinKind -> Maybe JoinHead
+skipOuterThenJoin tokens kind =
+    case tokens of
+
+        a :: rest ->
+            if upperWord a == "OUTER" then
+                expectJoin rest kind
+
+            else
+                expectJoin tokens kind
+
+        [] ->
+            Nothing
+
+
+expectJoin : List Token -> JoinKind -> Maybe JoinHead
+expectJoin tokens kind =
+    case tokens of
+
+        a :: rest ->
+            if upperWord a == "JOIN" then
+                Just { kind = kind, rest = rest }
+
+            else
+                Nothing
+
+        [] ->
+            Nothing
+
+
+skipOn : List Token -> List Token
+skipOn tokens =
+    case tokens of
+
+        [] ->
+            []
+
+        t :: rest ->
+            if isJoinStartKw t || isClauseKeyword t then
+                tokens
+
+            else
+                skipOn rest
+
+
+upperWord : Token -> String
+upperWord t =
+    case t of
+
+        TWord w ->
+            String.toUpper w
+
+        _ ->
+            ""
+
+
+memberUpper : Token -> List String -> Bool
+memberUpper t words =
+    case t of
+
+        TWord w ->
+            List.member (String.toUpper w) words
+
+        _ ->
+            False
+
+
+isJoinStartKw : Token -> Bool
+isJoinStartKw t =
+    memberUpper t [ "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "JOIN" ]
+
+
+isClauseKeyword : Token -> Bool
+isClauseKeyword t =
+    memberUpper
+        t
+        [ "WHERE"
+        , "GROUP"
+        , "ORDER"
+        , "LIMIT"
+        , "OFFSET"
+        , "HAVING"
+        , "UNION"
+        , "RETURNING"
+        ]
+
+
+isReservedAfterTable : Token -> Bool
+isReservedAfterTable t =
+    memberUpper
+        t
+        [ "ON"
+        , "AS"
+        , "USING"
+        , "INNER"
+        , "LEFT"
+        , "RIGHT"
+        , "FULL"
+        , "CROSS"
+        , "JOIN"
+        , "WHERE"
+        , "GROUP"
+        , "ORDER"
+        , "LIMIT"
+        , "OFFSET"
+        , "HAVING"
+        , "UNION"
+        ]
+
+
+parseSelectItems : List (List Token) -> List SelectItem -> Result Error (List SelectItem)
+parseSelectItems sections acc =
+    case sections of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        section :: rest ->
+            case parseSelectItem section of
+
+                Err e ->
+                    Err e
+
+                Ok item ->
+                    parseSelectItems rest (item :: acc)
+
+type alias AliasParse =
+    { core : List Token
+    , aliasName : Maybe String
+    , force : Force
+    }
+
+
+parseSelectItem : List Token -> Result Error SelectItem
+parseSelectItem section =
+    let
+        ap = splitAlias section
+        core = ap.core
+        aliasOpt = ap.aliasName
+        force = ap.force
+    in
+        case core of
+
+            [t] ->
+                if isSym "*" t then
+                    Ok (SiStar Nothing)
+
+                else
+                    case wordOf t of
+
+                        Just col ->
+                            Ok (SiCol Nothing col aliasOpt force)
+
+                        Nothing ->
+                            Err
+                                (Error.invalidInput "unsupported projection item")
+
+            [a, dot, b] ->
+                if isSym "." dot && isSym "*" b then
+                    case wordOf a of
+
+                        Just q ->
+                            Ok (SiStar (Just q))
+
+                        Nothing ->
+                            Err
+                                (Error.invalidInput "unsupported projection item")
+
+                else
+                    case ( wordOf a, wordOf b ) of
+
+                        ( Just q, Just col ) ->
+                            if isSym "." dot then
+                                Ok (SiCol (Just q) col aliasOpt force)
+
+                            else
+                                Err
+                                    (Error.invalidInput
+                                        "unsupported projection item")
+
+                        _ ->
+                            Err
+                                (Error.invalidInput "unsupported projection item")
+
+            _ ->
+                parseAggItem core aliasOpt force
+-- ===========================================================================
+-- Aggregate / expression projection parsing
+--   FUNC ( <arg> )                  FUNC in count/sum/avg/min/max/total
+--   COALESCE ( <inner> , <literal> ) / IFNULL ( <inner> , <literal> )
+-- All require an `AS alias` (loud-fail otherwise).
+-- ===========================================================================
+
+
+parseAggItem : List Token -> Maybe String -> Force -> Result Error SelectItem
+parseAggItem core aliasOpt force =
+    case aliasOpt of
+
+        Nothing ->
+            Err
+                (Error.invalidInput
+                    "aggregate/expression projection requires an `AS alias`")
+
+        Just aliasStr ->
+            case core of
+
+                funcTok :: rest ->
+                    case wordOf funcTok of
+
+                        Just fname ->
+                            parseCallBody fname rest aliasStr force
+
+                        Nothing ->
+                            Err
+                                (Error.invalidInput "unsupported projection item")
+
+                [] ->
+                    Err (Error.invalidInput "empty projection item")
+
+
+parseCallBody : String -> List Token -> String -> Force -> Result Error SelectItem
+parseCallBody fname rest aliasStr force =
+    betweenParens rest
+        |> Result.andThen
+               (\res ->
+                   let
+                       inner = fst res
+                       after = snd res
+                   in
+                       if not (List.isEmpty after) then
+                           Err
+                               (Error.invalidInput
+                                   ("unsupported expression after " ++ fname
+                                       ++ "(...) projection (only a single FUNC(...) call is supported)"))
+
+                       else
+                           let
+                               u = String.toUpper fname
+                           in
+                               if u == "COALESCE" || u == "IFNULL" then
+                                   parseCoalesce inner aliasStr force
+
+                               else
+                                   case parseAggFunc fname of
+
+                                       Just f ->
+                                           parseAggArg f inner aliasStr force
+
+                                       Nothing ->
+                                           Err
+                                               (Error.invalidInput
+                                                   ("unsupported function in projection: "
+                                                       ++ fname)))
+
+
+parseAggFunc : String -> Maybe AggFunc
+parseAggFunc w =
+    let
+        u = String.toUpper w
+    in
+        if u == "COUNT" then
+            Just AggCount
+
+        else if u == "SUM" then
+            Just AggSum
+
+        else if u == "AVG" then
+            Just AggAvg
+
+        else if u == "MIN" then
+            Just AggMin
+
+        else if u == "MAX" then
+            Just AggMax
+
+        else if u == "TOTAL" then
+            Just AggTotal
+
+        else
+            Nothing
+
+
+isStarArg : List Token -> Bool
+isStarArg toks =
+    case toks of
+
+        [t] ->
+            isSym "*" t
+
+        _ ->
+            False
+
+
+parseColRef : List Token -> Maybe ( Maybe String, String )
+parseColRef toks =
+    case toks of
+
+        [t] ->
+            case wordOf t of
+
+                Just col ->
+                    Just ( Nothing, col )
+
+                Nothing ->
+                    Nothing
+
+        [a, dot, b] ->
+            if isSym "." dot then
+                case ( wordOf a, wordOf b ) of
+
+                    ( Just q, Just col ) ->
+                        Just ( Just q, col )
+
+                    _ ->
+                        Nothing
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+parseAggArg : AggFunc -> List Token -> String -> Force -> Result Error SelectItem
+parseAggArg f inner aliasStr force =
+    if isStarArg inner then
+        case f of
+
+            AggCount ->
+                Ok (SiAgg AggCount AggStar aliasStr force)
+
+            _ ->
+                Err
+                    (Error.invalidInput
+                        ("`*` is only valid as the argument to count(...), not "
+                            ++ aggName f))
+
+    else
+        case parseColRef inner of
+
+            Just ( q, col ) ->
+                Ok (SiAgg f (AggCol q col) aliasStr force)
+
+            Nothing ->
+                Err
+                    (Error.invalidInput
+                        ("unsupported argument to " ++ aggName f
+                            ++ "(...); expected a single column reference or *"))
+
+
+parseCoalesce : List Token -> String -> Force -> Result Error SelectItem
+parseCoalesce inner aliasStr force =
+    case splitCommas inner of
+
+        [innerExpr, fallbackExpr] ->
+            parseCoalesceInner innerExpr
+                |> Result.andThen
+                       (\ci ->
+                           parseLiteralKind fallbackExpr
+                               |> Result.map
+                                      (\lk -> SiCoalesce ci lk aliasStr force))
+
+        _ ->
+            Err
+                (Error.invalidInput
+                    "coalesce/ifnull in the v1 subset must be coalesce(<agg|column>, <literal>) with exactly two arguments")
+
+
+parseCoalesceInner : List Token -> Result Error CoalesceInner
+parseCoalesceInner toks =
+    case toks of
+
+        funcTok :: rest ->
+            case wordOf funcTok of
+
+                Just fname ->
+                    case parseAggFunc fname of
+
+                        Just f ->
+                            betweenParens rest
+                                |> Result.andThen
+                                       (\res ->
+                                           let
+                                               innerArgs = fst res
+                                               after = snd res
+                                           in
+                                               if not (List.isEmpty after) then
+                                                   Err
+                                                       (Error.invalidInput
+                                                           "unsupported expression inside coalesce(...)")
+
+                                               else
+                                                   coalesceAggArg f innerArgs)
+
+                        Nothing ->
+                            coalesceColRef toks
+
+                Nothing ->
+                    coalesceColRef toks
+
+        [] ->
+            Err (Error.invalidInput "empty coalesce/ifnull inner expression")
+
+
+coalesceAggArg : AggFunc -> List Token -> Result Error CoalesceInner
+coalesceAggArg f innerArgs =
+    if isStarArg innerArgs then
+        case f of
+
+            AggCount ->
+                Ok (CiAgg AggCount AggStar)
+
+            _ ->
+                Err
+                    (Error.invalidInput
+                        ("`*` is only valid as the argument to count(...), not "
+                            ++ aggName f))
+
+    else
+        case parseColRef innerArgs of
+
+            Just ( q, col ) ->
+                Ok (CiAgg f (AggCol q col))
+
+            Nothing ->
+                Err
+                    (Error.invalidInput
+                        ("unsupported argument to " ++ aggName f
+                            ++ "(...) inside coalesce; expected a single column or *"))
+
+
+coalesceColRef : List Token -> Result Error CoalesceInner
+coalesceColRef toks =
+    case parseColRef toks of
+
+        Just ( q, col ) ->
+            Ok (CiCol q col)
+
+        Nothing ->
+            Err
+                (Error.invalidInput
+                    "unsupported inner expression in coalesce/ifnull (expected an aggregate call or a column reference)")
+
+
+parseLiteralKind : List Token -> Result Error LitKind
+parseLiteralKind toks =
+    case toks of
+
+        [t] ->
+            case t of
+
+                TNum n ->
+                    if String.contains "." n then
+                        Ok LFloat
+
+                    else
+                        Ok LInt
+
+                TStr _ ->
+                    Ok LString
+
+                _ ->
+                    Err
+                        (Error.invalidInput
+                            "coalesce/ifnull fallback must be a numeric or string literal")
+
+        _ ->
+            Err
+                (Error.invalidInput
+                    "coalesce/ifnull fallback must be a single literal value")
+-- split trailing  AS <alias>  (alias may be a quoted ident with !/? suffix)
+
+
+splitAlias : List Token -> AliasParse
+splitAlias section =
+    case findAs section [] of
+
+        Just ( core, aliasTok ) ->
+            let
+                ( name, force ) = stripForce aliasTok
+            in
+                { core = core, aliasName = Just name, force = force }
+
+        Nothing ->
+            { core = section, aliasName = Nothing, force = FNone }
+
+
+findAs : List Token -> List Token -> Maybe ( List Token, String )
+findAs tokens acc =
+    case tokens of
+
+        asTok :: aliasTok :: [] ->
+            if keywordIs "AS" asTok then
+                case wordOf aliasTok of
+
+                    Just aliasStr ->
+                        Just ( List.reverse acc, aliasStr )
+
+                    Nothing ->
+                        findAs (aliasTok :: []) (asTok :: acc)
+
+            else
+                findAs (aliasTok :: []) (asTok :: acc)
+
+        t :: rest ->
+            findAs rest (t :: acc)
+
+        [] ->
+            Nothing
+
+
+stripForce : String -> ( String, Force )
+stripForce s =
+    if String.endsWith "!" s then
+        ( String.slice 0 (String.length s - 1) s, FNotNull )
+
+    else if String.endsWith "?" s then
+        ( String.slice 0 (String.length s - 1) s, FNull )
+
+    else
+        ( s, FNone )
+-- ===========================================================================
+-- RETURNING (optional trailing clause on INSERT / UPDATE / DELETE)
+-- ===========================================================================
+-- Scan for a top-level RETURNING keyword and parse the projection that
+-- follows (the same projection grammar as SELECT). Absent -> Ok [].
+
+
+parseReturning : List Token -> Result Error (List SelectItem)
+parseReturning tokens =
+    case dropUntilReturning tokens of
+
+        Nothing ->
+            Ok []
+
+        Just afterRet ->
+            if List.isEmpty afterRet then
+                Err (Error.invalidInput "RETURNING requires a projection list")
+
+            else
+                parseSelectItems (splitCommas afterRet) []
+
+
+dropUntilReturning : List Token -> Maybe (List Token)
+dropUntilReturning tokens =
+    case tokens of
+
+        [] ->
+            Nothing
+
+        t :: rest ->
+            if keywordIs "RETURNING" t then
+                Just rest
+
+            else
+                dropUntilReturning rest
+-- ===========================================================================
+-- INSERT
+-- ===========================================================================
+
+
+parseInsert : List Token -> Result Error ParsedStmt
+parseInsert tokens =
+    case tokens of
+
+        a :: b :: tableTok :: afterTable ->
+            if eqTokWord a "INSERT" && eqTokWord b "INTO" then
+                case wordOf tableTok of
+
+                    Just table ->
+                        case betweenParens afterTable of
+
+                            Ok ( inner, _ ) ->
+                                parseReturning tokens
+                                    |> Result.map
+                                           (\ret ->
+                                               PInsert
+                                                   { table = table
+                                                   , columns = List.filterMap wordOf inner
+                                                   , returning = ret
+                                                   })
+
+                            Err _ ->
+                                Err
+                                    (Error.invalidInput
+                                        "INSERT requires an explicit (col, ...) list in the v1 subset")
+
+                    Nothing ->
+                        Err
+                            (Error.invalidInput
+                                "expected table name after INSERT INTO")
+
+            else
+                Err (Error.invalidInput "expected INSERT INTO")
+
+        _ ->
+            Err (Error.invalidInput "truncated INSERT statement")
+-- ===========================================================================
+-- UPDATE
+-- ===========================================================================
+
+
+parseUpdate : List Token -> Result Error ParsedStmt
+parseUpdate tokens =
+    case tokens of
+
+        a :: tableTok :: afterTable ->
+            if eqTokWord a "UPDATE" then
+                case wordOf tableTok of
+
+                    Just table ->
+                        case afterTable of
+
+                            setTok :: afterSet ->
+                                if keywordIs "SET" setTok then
+                                    let
+                                        ( setToks, _ ) =
+                                            takeUntil
+                                                (keywordIs "WHERE")
+                                                afterSet
+                                        cols =
+                                            List.filterMap
+                                                assignmentCol
+                                                (splitCommas setToks)
+                                    in
+                                        parseReturning tokens
+                                            |> Result.map
+                                                   (\ret ->
+                                                       PUpdate
+                                                           { table = table
+                                                           , setCols = cols
+                                                           , returning = ret
+                                                           })
+
+                                else
+                                    Err
+                                        (Error.invalidInput
+                                            "expected SET in UPDATE")
+
+                            [] ->
+                                Err (Error.invalidInput "UPDATE requires SET")
+
+                    Nothing ->
+                        Err
+                            (Error.invalidInput
+                                "expected table name after UPDATE")
+
+            else
+                Err (Error.invalidInput "expected UPDATE")
+
+        _ ->
+            Err (Error.invalidInput "truncated UPDATE statement")
+-- "col = @x" -> Just "col"
+
+
+assignmentCol : List Token -> Maybe String
+assignmentCol section =
+    case section of
+
+        colTok :: _ ->
+            wordOf colTok
+
+        [] ->
+            Nothing
+
+
+parseDelete : List Token -> Result Error ParsedStmt
+parseDelete tokens =
+    case tokens of
+
+        a :: b :: tableTok :: _ ->
+            if eqTokWord a "DELETE" && eqTokWord b "FROM" then
+                case wordOf tableTok of
+
+                    Just table ->
+                        parseReturning tokens
+                            |> Result.map
+                                   (\ret ->
+                                       PDelete
+                                           { table = table, returning = ret })
+
+                    Nothing ->
+                        Err
+                            (Error.invalidInput
+                                "expected table name after DELETE FROM")
+
+            else
+                Err (Error.invalidInput "expected DELETE FROM")
+
+        _ ->
+            Err (Error.invalidInput "truncated DELETE statement")

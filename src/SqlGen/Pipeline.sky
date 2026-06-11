@@ -1,0 +1,589 @@
+module SqlGen.Pipeline exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Dict as Dict
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+import SqlGen.Lexer as Lexer
+import SqlGen.Parser as Parser
+import SqlGen.Catalog as Catalog
+import SqlGen.Infer as Infer
+import SqlGen.Naming as Naming
+import SqlGen.Emit as Emit
+import SqlGen.Auto as Auto
+
+-- A raw statement tagged with its originating file
+-- collectCreates output: the parsed CREATE TABLEs + any skip warnings for DDL
+-- that failed to parse (its dependent queries then skip naturally when they
+-- can't type against the missing table).
+type alias TaggedStmt =
+    { file : String
+    , raw : RawStatement
+    }
+
+-- buildModules output: the emitted per-file modules, accumulated skip warnings,
+-- and the total count of generated query functions.
+type alias CreateScan =
+    { creates : List CreateTable
+    , warnings : List String
+    }
+
+-- A single file's outcome: an optional emitted module, the file's skip
+-- warnings (source order), and the count of generated query functions.
+type alias ModulesResult =
+    { files : List SourceFile
+    , warnings : List String
+    , generated : Int
+    }
+
+
+run : Config -> List FileContent -> List FileContent -> Result Error GenOutput
+run config schemaFiles queryFiles =
+    let
+        allFiles = dedupFiles (List.append schemaFiles queryFiles) []
+        allTagged = List.concat (List.map tagFile allFiles)
+        createScan = collectCreates allTagged [] []
+    in
+        collectModelOverrides allTagged Dict.empty
+            |> Result.andThen
+                   (\modelOv ->
+                       Catalog.validateOverrides config.overrides
+                           |> Result.andThen
+                                  (\typeOv ->
+                                      let
+                                          opts =
+                                              { singularize = config.singularize
+                                              , decimalMode = config.decimalAs
+                                              , typeOverrides = typeOv
+                                              , modelOverrides = modelOv
+                                              }
+                                      in
+                                          Catalog.build opts createScan.creates
+                                              |> Result.andThen
+                                                     (\cat ->
+                                                         buildModules
+                                                             config
+                                                             cat
+                                                             queryFiles
+                                                             |> Result.map
+                                                                    (\mres ->
+                                                                        { schema = { path = schemaOutPath
+                                                                                config
+                                                                          , source = Emit.emitSchema
+                                                                                config.modulePrefix
+                                                                                cat
+                                                                          }
+                                                                        , modules = mres.files
+                                                                        , warnings = List.append
+                                                                              createScan.warnings
+                                                                              mres.warnings
+                                                                        , generated = mres.generated
+                                                                        }))))
+
+
+tagFile : FileContent -> List TaggedStmt
+tagFile fc =
+    List.map
+        (\rs -> { file = fc.path, raw = rs })
+        (Lexer.splitStatements fc.content)
+
+
+dedupFiles : List FileContent -> List String -> List FileContent
+dedupFiles files seen =
+    case files of
+
+        [] ->
+            []
+
+        f :: rest ->
+            if List.member f.path seen then
+                dedupFiles rest seen
+
+            else
+                f :: dedupFiles rest (f.path :: seen)
+-- ---------------------------------------------------------------------------
+-- Phase A: collect CREATE TABLE statements into a catalog
+-- ---------------------------------------------------------------------------
+
+
+collectCreates : List TaggedStmt -> List CreateTable -> List String -> CreateScan
+collectCreates tagged acc warns =
+    case tagged of
+
+        [] ->
+            { creates = List.reverse acc, warnings = List.reverse warns }
+
+        ts :: rest ->
+            let
+                tokens = Lexer.lex ts.raw.sql
+            in
+                if Parser.isDdl tokens then
+                    case Parser.parseStatement tokens of
+
+                        Ok (PCreate ct) ->
+                            collectCreates rest (ct :: acc) warns
+
+                        Ok _ ->
+                        -- ALTER / DROP not modelled in v1; skip silently
+                            collectCreates rest acc warns
+-- A CREATE TABLE that fails to parse is skipped with a warning (its dependent
+-- queries then skip too, since they can't type against the missing table).
+
+                        Err e ->
+                            collectCreates
+                                rest
+                                acc
+                                (skipWarn ts.file ts.raw.line e :: warns)
+
+                else
+                    collectCreates rest acc warns
+-- ---------------------------------------------------------------------------
+-- Phase A2: collect @model renames (query annotation -> target table's Model)
+-- Parse / annotation errors are swallowed here (returned as no-op) so the real
+-- diagnostic surfaces with file:line during DML resolution.
+-- ---------------------------------------------------------------------------
+
+
+collectModelOverrides : List TaggedStmt -> Dict String String -> Result Error (Dict String String)
+collectModelOverrides tagged acc =
+    case tagged of
+
+        [] ->
+            Ok acc
+
+        ts :: rest ->
+            let
+                tokens = Lexer.lex ts.raw.sql
+            in
+                if Parser.isDdl tokens then
+                    collectModelOverrides rest acc
+
+                else
+                    case ts.raw.anno of
+
+                        Nothing ->
+                            collectModelOverrides rest acc
+
+                        Just rawAnno ->
+                            case Lexer.parseAnnotation rawAnno of
+
+                                Err _ ->
+                                    -- malformed annotation: skip here; the DML
+                                    -- fold surfaces the warning
+                                    collectModelOverrides rest acc
+
+                                Ok anno ->
+                                    case modelDirective anno.directives of
+
+                                        Nothing ->
+                                            collectModelOverrides rest acc
+
+                                        Just modelName ->
+                                            case Parser.parseStatement tokens of
+
+                                                Err _ ->
+                                                    collectModelOverrides
+                                                        rest
+                                                        acc
+
+                                                Ok parsed ->
+                                                    addModelOverride
+                                                        ts
+                                                        (Infer.stmtTable parsed)
+                                                        modelName
+                                                        acc
+                                                        rest
+
+
+addModelOverride : TaggedStmt -> String -> String -> Dict String String -> List TaggedStmt -> Result Error (Dict String String)
+addModelOverride ts table modelName acc rest =
+    let
+        key = String.toLower table
+    in
+        case Dict.get key acc of
+
+            Just existing ->
+                if existing == modelName then
+                    collectModelOverrides rest acc
+
+                else
+                    Err
+                        (locate
+                            ts.file
+                            ts.raw.line
+                            (Error.invalidInput
+                                ("conflicting @model for table '" ++ table
+                                    ++ "': '"
+                                    ++ existing
+                                    ++ "' vs '"
+                                    ++ modelName
+                                    ++ "'")))
+
+            Nothing ->
+                collectModelOverrides rest (Dict.insert key modelName acc)
+
+
+modelDirective : List Directive -> Maybe String
+modelDirective dirs =
+    List.head
+        (List.filterMap
+            (\d ->
+                case d of
+
+                    DModel n ->
+                        Just n
+
+                    _ ->
+                        Nothing)
+            dirs)
+-- ---------------------------------------------------------------------------
+-- Phase B: per query file, infer + emit a module
+-- ---------------------------------------------------------------------------
+
+
+buildModules : Config -> Catalog -> List FileContent -> Result Error ModulesResult
+buildModules config cat files =
+    buildModulesGo config cat files [] [] 0
+
+
+buildModulesGo : Config -> Catalog -> List FileContent -> List SourceFile -> List String -> Int -> Result Error ModulesResult
+buildModulesGo config cat files acc warns count =
+    case files of
+
+        [] ->
+            Ok
+                { files = List.reverse acc
+                , warnings = List.reverse warns
+                , generated = count
+                }
+
+        f :: rest ->
+            case buildOneModule config cat f of
+
+                Err e ->
+                    Err e
+
+                Ok mres ->
+                    let
+                        acc2 =
+                            case mres.file of
+
+                                Just sf ->
+                                    sf :: acc
+
+                                Nothing ->
+                                    acc
+                    in
+                        buildModulesGo
+                            config
+                            cat
+                            rest
+                            acc2
+                            (List.append (List.reverse mres.warnings) warns)
+                            (count + mres.generated)
+
+-- ---------------------------------------------------------------------------
+-- Per-module DML resolution with auto-naming (no `-- name:`) + skip-and-warn.
+-- Hard error ONLY on a duplicate of an explicit `-- name:` (the author owns
+-- that namespace). A statement that fails to parse / type is skipped with a
+-- warning so the rest of the file still generates. Auto-names never error —
+-- they integer-suffix on clash.
+-- ---------------------------------------------------------------------------
+type alias ModuleResult =
+    { file : Maybe SourceFile
+    , warnings : List String
+    , generated : Int
+    }
+
+
+buildOneModule : Config -> Catalog -> FileContent -> Result Error ModuleResult
+buildOneModule config cat f =
+    let
+        tagged =
+            List.map
+                (\rs -> { file = f.path, raw = rs })
+                (Lexer.splitStatements f.content)
+    in
+        resolveDmlList config cat tagged
+            |> Result.map
+                   (\res ->
+                       if List.isEmpty res.stmts then
+                           { file = Nothing
+                           , warnings = res.warnings
+                           , generated = 0
+                           }
+
+                       else
+                           let
+                               moduleName = moduleNameOf f.path
+                           in
+                               { file = Just
+                                     { path = moduleOutPath config moduleName
+                                     , source = Emit.emitQueryModule
+                                           config.modulePrefix
+                                           moduleName
+                                           res.stmts
+                                     }
+                               , warnings = res.warnings
+                               , generated = List.length res.stmts
+                               })
+
+type alias ResolveResult =
+    { stmts : List ResolvedStatement
+    , warnings : List String
+    }
+
+type alias FoldState =
+    { assigned : List String
+    , stmts : List ResolvedStatement
+    , warnings : List String
+    }
+
+
+resolveDmlList : Config -> Catalog -> List TaggedStmt -> Result Error ResolveResult
+resolveDmlList config cat tagged =
+    collectExplicitNames tagged []
+        |> Result.map
+               (\explicit ->
+                   let
+                       final =
+                           resolveFold
+                               config
+                               cat
+                               tagged
+                               { assigned = explicit
+                               , stmts = []
+                               , warnings = []
+                               }
+                   in
+                       { stmts = List.reverse final.stmts
+                       , warnings = List.reverse final.warnings
+                       })
+
+
+-- Reserve every explicit `-- name:` up front so auto-names suffix AROUND them;
+-- a duplicate explicit name is a hard error (file:line).
+collectExplicitNames : List TaggedStmt -> List String -> Result Error (List String)
+collectExplicitNames tagged acc =
+    case tagged of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        ts :: rest ->
+            let
+                tokens = Lexer.lex ts.raw.sql
+            in
+                if Parser.isDdl tokens then
+                    collectExplicitNames rest acc
+
+                else
+                    case ts.raw.anno of
+
+                        Nothing ->
+                            collectExplicitNames rest acc
+
+                        Just rawAnno ->
+                            case Lexer.parseAnnotation rawAnno of
+
+                                Err _ ->
+                                    collectExplicitNames rest acc
+
+                                Ok anno ->
+                                    if List.member anno.name acc then
+                                        Err
+                                            (locate
+                                                ts.file
+                                                ts.raw.line
+                                                (Error.invalidInput
+                                                    ("duplicate statement name `"
+                                                        ++ anno.name
+                                                        ++ "`")))
+
+                                    else
+                                        collectExplicitNames
+                                            rest
+                                            (anno.name :: acc)
+
+
+resolveFold : Config -> Catalog -> List TaggedStmt -> FoldState -> FoldState
+resolveFold config cat tagged st =
+    case tagged of
+
+        [] ->
+            st
+
+        ts :: rest ->
+            resolveFold config cat rest (resolveStep config cat ts st)
+
+
+resolveStep : Config -> Catalog -> TaggedStmt -> FoldState -> FoldState
+resolveStep config cat ts st =
+    let
+        tokens = Lexer.lex ts.raw.sql
+    in
+        if Parser.isDdl tokens then
+            st
+
+        else
+            case Parser.parseStatement tokens of
+
+                Err e ->
+                    addSkip ts e st
+
+                Ok parsed ->
+                    case ts.raw.anno of
+
+                        Just rawAnno ->
+                            case Lexer.parseAnnotation rawAnno of
+
+                                Err e ->
+                                    addSkip ts e st
+
+                                Ok anno ->
+                                    runInfer config cat ts tokens parsed anno st
+
+                        Nothing ->
+                            let
+                                auto = Auto.deriveName cat parsed tokens
+                                base = makeUnique auto.base st.assigned
+                                anno =
+                                    { name = base
+                                    , card = auto.card
+                                    , directives = []
+                                    }
+                            in
+                                runInfer config cat ts tokens parsed anno st
+
+
+runInfer : Config -> Catalog -> TaggedStmt -> List Token -> ParsedStmt -> Annotation -> FoldState -> FoldState
+runInfer config cat ts tokens parsed anno st =
+    let
+        prep =
+            { anno = anno
+            , parsed = parsed
+            , tokens = tokens
+            , rawSql = ts.raw.sql
+            , line = ts.raw.line
+            }
+    in
+        case Infer.infer config.dialect cat prep of
+
+            Err e ->
+                addSkip ts e st
+
+            Ok rs ->
+                { st | stmts = rs :: st.stmts
+                , assigned = addAssigned anno.name st.assigned
+                }
+
+
+addSkip : TaggedStmt -> Error -> FoldState -> FoldState
+addSkip ts e st =
+    { st | warnings = skipWarn ts.file ts.raw.line e :: st.warnings }
+
+
+addAssigned : String -> List String -> List String
+addAssigned name assigned =
+    if List.member name assigned then
+        assigned
+
+    else
+        name :: assigned
+-- Smallest integer suffix that makes `base` unique within the module.
+
+
+makeUnique : String -> List String -> String
+makeUnique base assigned =
+    if not (List.member base assigned) then
+        base
+
+    else
+        suffixGo base 1 assigned
+
+
+suffixGo : String -> Int -> List String -> String
+suffixGo base i assigned =
+    let
+        candidate = base ++ String.fromInt i
+    in
+        if List.member candidate assigned then
+            suffixGo base (i + 1) assigned
+
+        else
+            candidate
+-- ---------------------------------------------------------------------------
+-- Paths / names
+-- ---------------------------------------------------------------------------
+
+
+baseNameOf : String -> String
+baseNameOf path =
+    let
+        afterSlash =
+            case List.reverse (String.split "/" path) of
+
+                last :: _ ->
+                    last
+
+                [] ->
+                    path
+    in
+        stripSqlExt afterSlash
+
+
+stripSqlExt : String -> String
+stripSqlExt name =
+    if String.endsWith ".sql" name then
+        String.slice 0 (String.length name - 4) name
+
+    else
+        name
+
+
+moduleNameOf : String -> String
+moduleNameOf path =
+    Naming.snakeToPascal (baseNameOf path)
+
+
+schemaOutPath : Config -> String
+schemaOutPath config =
+    config.out ++ "/Schema.sky"
+
+
+moduleOutPath : Config -> String -> String
+moduleOutPath config moduleName =
+    config.out ++ "/" ++ moduleName ++ ".sky"
+
+
+locate : String -> Int -> Error -> Error
+locate file line e =
+    let
+        raw = Error.toString e
+        msg =
+            if String.startsWith "InvalidInput: " raw then
+                String.slice 14 (String.length raw) raw
+
+            else
+                raw
+    in
+        Error.invalidInput (file ++ ":" ++ String.fromInt line ++ ": " ++ msg)
+-- A skip warning line: `[skip] file:line: <reason>` (reason stripped of the
+-- `InvalidInput: ` prefix). Surfaced to the operator; the statement is excluded
+-- and the rest of the run continues.
+
+
+skipWarn : String -> Int -> Error -> String
+skipWarn file line e =
+    let
+        raw = Error.toString e
+        msg =
+            if String.startsWith "InvalidInput: " raw then
+                String.slice 14 (String.length raw) raw
+
+            else
+                raw
+    in
+        "[skip] " ++ file ++ ":" ++ String.fromInt line ++ ": " ++ msg

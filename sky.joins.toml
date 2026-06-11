@@ -1,0 +1,12 @@
+# Standalone config for the JOIN example (sql/joins.sql).
+# Kept separate from sky.toml because joins.sql declares its own `users`
+# table, which would collide with the users.sql catalog in a single run.
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/joins.sql"]
+queries     = ["sql/joins.sql"]
+out         = "src/GenJoins"
+module      = "GenJoins"
+singularize = true
+verify      = true

@@ -1,0 +1,10 @@
+# Standalone config for the IN (@list) example (sql/inlist.sql).
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/inlist.sql"]
+queries     = ["sql/inlist.sql"]
+out         = "src/GenInList"
+module      = "GenInList"
+singularize = true
+verify      = true

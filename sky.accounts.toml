@@ -1,0 +1,20 @@
+# Standalone config for the override + @model example (sql/accounts.sql).
+# Kept separate so the default users.sql run stays byte-identical.
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/accounts.sql"]
+queries     = ["sql/accounts.sql"]
+out         = "src/GenAccounts"
+module      = "GenAccounts"
+singularize = true
+verify      = true
+
+# Per-column type overrides win over the default SQL-type -> Sky-type mapping.
+[[sqlgen.override]]
+column   = "accounts.balance"
+sky_type = "Money"
+
+[[sqlgen.override]]
+column   = "accounts.rate"
+sky_type = "Decimal"

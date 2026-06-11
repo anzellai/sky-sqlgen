@@ -1,0 +1,484 @@
+module SqlGen.Types exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Dict as Dict
+
+-- ---------------------------------------------------------------------------
+-- Base Sky types a column / param can have
+-- ---------------------------------------------------------------------------
+type SkyType
+    = TInt
+    | TFloat
+    | TString
+    | TBool
+    | TBytes
+    | TDecimal
+    | TMoney
+-- ---------------------------------------------------------------------------
+-- Tokens (lexer output)
+-- ---------------------------------------------------------------------------
+
+type Force
+    = FNone
+    | FNotNull
+    | FNull
+
+type Token
+    = TWord String
+    | TStr String
+    | TNum String
+    | TParam String Force
+    | TSym String
+-- ---------------------------------------------------------------------------
+-- Raw statements (after splitting a file, before token parse)
+-- ---------------------------------------------------------------------------
+
+type alias RawAnno =
+    { nameLine : String
+    , directiveLines : List String
+    }
+-- ---------------------------------------------------------------------------
+-- Parsed annotation
+-- ---------------------------------------------------------------------------
+
+type alias RawStatement =
+    { anno : Maybe RawAnno
+    , sql : String
+    , line : Int
+    }
+-- ---------------------------------------------------------------------------
+-- Parsed SQL AST (only what inference needs)
+-- ---------------------------------------------------------------------------
+
+type Cardinality
+    = COne
+    | CMany
+    | CExec
+    | CExecRows
+    | CScalar
+    | CScalarMany
+
+type alias TypeSpec =
+    { base : SkyType
+    , nullable : Bool
+    }
+-- Aggregate / expression projection support.
+--   AggFunc      the supported aggregate functions
+--   AggArg       `*` (count only) or a single (possibly qualified) column
+--   LitKind      the kind of literal used as a COALESCE / IFNULL fallback
+--   CoalesceInner the inner expression wrapped by COALESCE / IFNULL
+
+type Directive
+    = DParam String TypeSpec
+    | DNullable String
+    | DNotNull String
+    | DModel String
+    | DOmit (List String)
+
+type alias Annotation =
+    { name : String
+    , card : Cardinality
+    , directives : List Directive
+    }
+-- ---------------------------------------------------------------------------
+-- Resolved statement (inference output, emitter input)
+-- ---------------------------------------------------------------------------
+
+type alias ParsedColumn =
+    { name : String
+    , typeWords : List String
+    , notNull : Bool
+    , primaryKey : Bool
+    , unique : Bool
+    , hasDefault : Bool
+    }
+-- ---------------------------------------------------------------------------
+-- Config
+-- ---------------------------------------------------------------------------
+
+type alias CreateTable =
+    { name : String
+    , columns : List ParsedColumn
+    , pkCols : List String
+    , uniqueCols : List String
+    }
+-- A per-column type override from `[[sqlgen.override]]` in sky.toml.
+--   column   = "table.col"  ->  table / column (split on the dot)
+--   sky_type = "Money"      ->  skyTypeRaw (validated against the base types)
+
+type AggFunc
+    = AggCount
+    | AggSum
+    | AggAvg
+    | AggMin
+    | AggMax
+    | AggTotal
+
+type AggArg
+    = AggStar
+    | AggCol (Maybe String) String
+
+type LitKind
+    = LInt
+    | LFloat
+    | LString
+
+type CoalesceInner
+    = CiAgg AggFunc AggArg
+    | CiCol (Maybe String) String
+-- A projection item.
+--   SiStar (Maybe qualifier)             -- `*` or `t.*`
+--   SiCol qualifier column alias force    -- plain column ref
+--   SiAgg func arg alias force            -- count/sum/avg/min/max/total(...)
+--   SiCoalesce inner litKind alias force  -- coalesce/ifnull(<inner>, <literal>)
+
+type SelectItem
+    = SiStar (Maybe String)
+    | SiCol (Maybe String) String (Maybe String) Force
+    | SiAgg AggFunc AggArg String Force
+    | SiCoalesce CoalesceInner LitKind String Force
+
+type JoinKind
+    = JInner
+    | JLeft
+    | JCross
+    | JRight
+    | JFull
+
+type alias Join =
+    { kind : JoinKind
+    , table : String
+    , aliasName : Maybe String
+    , usingCols : List String
+    }
+-- Options that drive catalog construction (bundled so the recursive
+-- builders don't thread four positional args).
+--   typeOverrides  keyed "table.col" (both lowercased) -> resolved SkyType
+--   modelOverrides keyed "table" (lowercased)          -> @model rename
+
+-- A derived-table source `FROM (SELECT ...) sub` is carried as the subquery's
+-- raw inner tokens (re-parsed in Infer). Storing tokens — not a nested
+-- SelectStmt — keeps SelectStmt non-recursive (a self-recursive alias trips HM
+-- cross-module). `fromSubTokens = []` means a plain catalog table source.
+
+type alias SelectStmt =
+    { items : List SelectItem
+    , fromTable : String
+    , fromAlias : Maybe String
+    , joins : List Join
+    , fromSubTokens : List Token
+    }
+-- ---------------------------------------------------------------------------
+-- Small helpers
+-- ---------------------------------------------------------------------------
+
+type alias InsertStmt =
+    { table : String
+    , columns : List String
+    , returning : List SelectItem
+    }
+-- A single column of a DEFAULT-omittable INSERT builder (opt-in via `-- @omit`).
+--   sqlCol     literal SQL column name (from the INSERT column list)
+--   field      the `params.<field>` accessor (camelCase)
+--   skyType    base type (drives Db.Sql* / Db.fromMaybe* for non-omittable cols)
+--   nullable   catalog nullability (chooses Db.Sql* vs Db.fromMaybe*)
+--   omittable  True -> field is SqlField (caller picks SetField/OmitField);
+--              False -> always-present, wrapped `SetField (Db.Sql* params.f)`
+
+type alias UpdateStmt =
+    { table : String
+    , setCols : List String
+    , returning : List SelectItem
+    }
+
+type alias DeleteStmt =
+    { table : String
+    , returning : List SelectItem
+    }
+
+type ParsedStmt
+    = PCreate CreateTable
+    | PSelect SelectStmt
+    | PInsert InsertStmt
+    | PUpdate UpdateStmt
+    | PDelete DeleteStmt
+-- ---------------------------------------------------------------------------
+-- Catalog
+-- ---------------------------------------------------------------------------
+
+type alias CatColumn =
+    { name : String
+    , skyType : SkyType
+    , nullable : Bool
+    , isPrimaryKey : Bool
+    , unique : Bool
+    , hasDefault : Bool
+    }
+
+type alias CatTable =
+    { name : String
+    , modelName : String
+    , decoderName : String
+    , columns : List CatColumn
+    }
+
+type alias Catalog =
+    { tables : Dict String CatTable
+    , order : List String
+    }
+
+type alias ResolvedParam =
+    { field : String
+    , skyType : SkyType
+    , nullable : Bool
+    , isList : Bool
+    , isOmit : Bool
+    }
+
+type alias InsertCol =
+    { sqlCol : String
+    , field : String
+    , skyType : SkyType
+    , nullable : Bool
+    , omittable : Bool
+    }
+
+type alias ResolvedColumn =
+    { field : String
+    , column : String
+    , skyType : SkyType
+    , nullable : Bool
+    }
+
+type ResultShape
+    = NoResult
+    | ReuseModel String String
+    | RowType String String (List ResolvedColumn)
+    | ScalarType ResolvedColumn
+
+type alias ResolvedStatement =
+    { baseName : String
+    , fnName : String
+    , card : Cardinality
+    , sql : String
+    , params : List ResolvedParam
+    , argOrder : List String
+    , result : ResultShape
+    , sqlChunks : List String
+    , sqlListFields : List String
+    , insertCols : List InsertCol
+    , insertTable : String
+    }
+
+type Dialect
+    = DSqlite
+    | DPostgres
+-- How to map exact-numeric SQL types (NUMERIC / DECIMAL / DEC).
+--   DMDecimal -> Std.Decimal.Decimal (default, lossless)
+--   DMFloat   -> Float (opt-in lossy)
+--   DMMoney   -> Std.Money.Money (treat NUMERIC as money)
+
+type DecimalMode
+    = DMDecimal
+    | DMFloat
+    | DMMoney
+
+type alias FileContent =
+    { path : String
+    , content : String
+    }
+
+type alias SourceFile =
+    { path : String
+    , source : String
+    }
+
+type alias GenOutput =
+    { schema : SourceFile
+    , modules : List SourceFile
+    , warnings : List String
+    , generated : Int
+    }
+
+type alias ColumnOverride =
+    { table : String
+    , column : String
+    , skyTypeRaw : String
+    }
+
+type alias Config =
+    { dialect : Dialect
+    , schema : List String
+    , queries : List String
+    , out : String
+    , modulePrefix : String
+    , singularize : Bool
+    , verify : Bool
+    , decimalAs : DecimalMode
+    , overrides : List ColumnOverride
+    }
+
+type alias CatalogOpts =
+    { singularize : Bool
+    , decimalMode : DecimalMode
+    , typeOverrides : Dict String SkyType
+    , modelOverrides : Dict String String
+    }
+
+
+skyTypeName : SkyType -> String
+skyTypeName t =
+    case t of
+
+        TInt ->
+            "Int"
+
+        TFloat ->
+            "Float"
+
+        TString ->
+            "String"
+
+        TBool ->
+            "Bool"
+
+        TBytes ->
+            "Bytes"
+
+        TDecimal ->
+            "Decimal"
+
+        TMoney ->
+            "Money"
+-- The qualified Db.* SqlValue constructor for a non-null param of this type.
+
+
+sqlValueCtor : SkyType -> String
+sqlValueCtor t =
+    case t of
+
+        TInt ->
+            "Db.SqlInt"
+
+        TFloat ->
+            "Db.SqlFloat"
+
+        TString ->
+            "Db.SqlString"
+
+        TBool ->
+            "Db.SqlBool"
+
+        TBytes ->
+            "Db.SqlBytes"
+
+        TDecimal ->
+            "Db.SqlDecimal"
+
+        TMoney ->
+            "Db.SqlMoney"
+-- The Db.fromMaybe* helper for a nullable param of this type.
+
+
+sqlFromMaybe : SkyType -> String
+sqlFromMaybe t =
+    case t of
+
+        TInt ->
+            "Db.fromMaybeInt"
+
+        TFloat ->
+            "Db.fromMaybeFloat"
+
+        TString ->
+            "Db.fromMaybeString"
+
+        TBool ->
+            "Db.fromMaybeBool"
+
+        TBytes ->
+            "Db.fromMaybeBytes"
+
+        TDecimal ->
+            "Db.fromMaybeDecimal"
+
+        TMoney ->
+            "Db.fromMaybeMoney"
+-- The DbDecode primitive for a column of this type.
+-- TDecimal routes to the emitted `decimalCol` helper (no built-in
+-- DbDecode.decimal exists); both are prefix-applied to "col".
+
+
+dbDecodePrim : SkyType -> String
+dbDecodePrim t =
+    case t of
+
+        TInt ->
+            "DbDecode.int"
+
+        TFloat ->
+            "DbDecode.float"
+
+        TString ->
+            "DbDecode.string"
+
+        TBool ->
+            "DbDecode.bool"
+
+        TBytes ->
+            "DbDecode.string"
+
+        TDecimal ->
+            "decimalCol"
+
+        TMoney ->
+            "DbDecode.money"
+-- Lowercase spelling of an aggregate function (for error messages).
+
+
+aggName : AggFunc -> String
+aggName f =
+    case f of
+
+        AggCount ->
+            "count"
+
+        AggSum ->
+            "sum"
+
+        AggAvg ->
+            "avg"
+
+        AggMin ->
+            "min"
+
+        AggMax ->
+            "max"
+
+        AggTotal ->
+            "total"
+
+
+cardName : Cardinality -> String
+cardName c =
+    case c of
+
+        COne ->
+            "one"
+
+        CMany ->
+            "many"
+
+        CExec ->
+            "exec"
+
+        CExecRows ->
+            "execrows"
+
+        CScalar ->
+            "scalar"
+
+        CScalarMany ->
+            "scalarmany"

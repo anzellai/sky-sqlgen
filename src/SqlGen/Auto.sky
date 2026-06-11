@@ -1,0 +1,256 @@
+module SqlGen.Auto exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import SqlGen.Types exposing (..)
+import SqlGen.Catalog as Catalog
+import SqlGen.Naming as Naming
+
+-- ===========================================================================
+-- Auto-naming: derive a PascalCase base name + a cardinality for a DML
+-- statement that has NO `-- name:` annotation. An explicit annotation always
+-- wins; this is only the no-annotation path.
+--
+-- Verb + cardinality (the catalog drives the SELECT case):
+--   SELECT  -> get  + :one   when a WHERE equality (col = @p) binds a PRIMARY
+--                            KEY or UNIQUE column of the queried table, OR the
+--                            projection is aggregate-only;
+--              list + :many  otherwise.
+--   INSERT  -> create; :execrows (no RETURNING) | :one  (RETURNING).
+--   UPDATE  -> update;  :execrows (no RETURNING) | :many (RETURNING).
+--   DELETE  -> delete;  :execrows (no RETURNING) | :many (RETURNING).
+--
+-- Entity   = the target table (FROM / INTO / UPDATE / DELETE FROM). `list`
+--            keeps the table name as-is (PascalCased); the singular verbs use
+--            the singularised form.
+-- By<cols> = the WHERE equality columns bound to params, PascalCased and
+--            joined with `And`, prefixed `By` (ById, ByOrgIdAndStatus).
+--
+-- Always produces a valid name — an undeterminable entity falls back to
+-- `<Verb>Query`.
+-- ===========================================================================
+type alias AutoName =
+    { base : String
+    , card : Cardinality
+    }
+-- ---------------------------------------------------------------------------
+-- Base-name assembly
+-- ---------------------------------------------------------------------------
+-- verb (lowercase) + entity (PascalCase, singularised when `singular`) + the
+-- pre-built `By<cols>` suffix. An empty entity falls back to `Query`.
+
+
+deriveName : Catalog -> ParsedStmt -> List Token -> AutoName
+deriveName cat parsed tokens =
+    case parsed of
+
+        PSelect sel ->
+            deriveSelect cat sel tokens
+
+        PInsert ins ->
+            { base = verbEntity "create" ins.table True ""
+            , card = if List.isEmpty ins.returning then
+                  CExecRows
+
+              else
+                  COne
+            }
+
+        PUpdate upd ->
+            { base = verbEntity "update" upd.table True (byPart (whereEqCols tokens))
+            , card = if List.isEmpty upd.returning then
+                  CExecRows
+
+              else
+                  CMany
+            }
+
+        PDelete del ->
+            { base = verbEntity "delete" del.table True (byPart (whereEqCols tokens))
+            , card = if List.isEmpty del.returning then
+                  CExecRows
+
+              else
+                  CMany
+            }
+
+        PCreate _ ->
+            -- DDL never reaches here (filtered before resolution).
+            { base = "Query", card = COne }
+
+
+deriveSelect : Catalog -> SelectStmt -> List Token -> AutoName
+deriveSelect cat sel tokens =
+    let
+        eqCols = whereEqCols tokens
+        isOne =
+            anyKeyCol cat sel.fromTable eqCols || aggregateOnly sel.items
+        verb =
+            if isOne then
+                "get"
+
+            else
+                "list"
+    in
+        { base = verbEntity verb sel.fromTable (verb /= "list") (byPart eqCols)
+        , card = if isOne then
+              COne
+
+          else
+              CMany
+        }
+
+
+verbEntity : String -> String -> Bool -> String -> String
+verbEntity verb table singular byCols =
+    let
+        entity =
+            if String.isEmpty table then
+                "Query"
+
+            else if singular then
+                Naming.snakeToPascal (Naming.singularizeTable table)
+
+            else
+                Naming.snakeToPascal table
+    in
+        Naming.upperFirst verb ++ entity ++ byCols
+
+
+byPart : List String -> String
+byPart cols =
+    if List.isEmpty cols then
+        ""
+
+    else
+        "By" ++ String.join "And" (List.map Naming.snakeToPascal cols)
+-- ---------------------------------------------------------------------------
+-- WHERE equality columns bound to params (col = @p / t.col = @p / @p = col)
+-- ---------------------------------------------------------------------------
+
+
+whereEqCols : List Token -> List String
+whereEqCols tokens =
+    case dropUntilWhere tokens of
+
+        Nothing ->
+            []
+
+        Just afterWhere ->
+            distinct (scanEq afterWhere []) []
+
+
+dropUntilWhere : List Token -> Maybe (List Token)
+dropUntilWhere tokens =
+    case tokens of
+
+        [] ->
+            Nothing
+
+        t :: rest ->
+            if isUpperWord "WHERE" t then
+                Just rest
+
+            else
+                dropUntilWhere rest
+
+
+scanEq : List Token -> List String -> List String
+scanEq tokens acc =
+    case tokens of
+
+        (TWord _) :: (TSym ".") :: (TWord col) :: (TSym "=") :: (TParam _ _) :: rest ->
+            scanEq rest (col :: acc)
+
+        (TWord col) :: (TSym "=") :: (TParam _ _) :: rest ->
+            scanEq rest (col :: acc)
+
+        (TParam _ _) :: (TSym "=") :: (TWord _) :: (TSym ".") :: (TWord col) :: rest ->
+            scanEq rest (col :: acc)
+
+        (TParam _ _) :: (TSym "=") :: (TWord col) :: rest ->
+            scanEq rest (col :: acc)
+
+        _ :: rest ->
+            scanEq rest acc
+
+        [] ->
+            List.reverse acc
+-- ---------------------------------------------------------------------------
+-- Cardinality helpers
+-- ---------------------------------------------------------------------------
+-- True when any of the given columns is a PRIMARY KEY or UNIQUE column of the
+-- queried table (so a `col = @p` equality selects at most one row).
+
+
+anyKeyCol : Catalog -> String -> List String -> Bool
+anyKeyCol cat tableName cols =
+    case Catalog.lookup tableName cat of
+
+        Nothing ->
+            False
+-- ---------------------------------------------------------------------------
+-- Small helpers
+-- ---------------------------------------------------------------------------
+
+        Just table ->
+            List.any (\c -> isKeyCol table c) cols
+
+
+isKeyCol : CatTable -> String -> Bool
+isKeyCol table col =
+    case List.find
+             (\c -> String.toLower c.name == String.toLower col)
+             table.columns of
+
+        Just c ->
+            c.isPrimaryKey || c.unique
+
+        Nothing ->
+            False
+
+
+aggregateOnly : List SelectItem -> Bool
+aggregateOnly items =
+    not (List.isEmpty items) && List.all isAggItem items
+
+
+isAggItem : SelectItem -> Bool
+isAggItem item =
+    case item of
+
+        SiAgg _ _ _ _ ->
+            True
+
+        SiCoalesce _ _ _ _ ->
+            True
+
+        _ ->
+            False
+
+
+isUpperWord : String -> Token -> Bool
+isUpperWord kw t =
+    case t of
+
+        TWord w ->
+            String.toUpper w == kw
+
+        _ ->
+            False
+
+
+distinct : List String -> List String -> List String
+distinct items acc =
+    case items of
+
+        [] ->
+            List.reverse acc
+
+        x :: rest ->
+            if List.member x acc then
+                distinct rest acc
+
+            else
+                distinct rest (x :: acc)

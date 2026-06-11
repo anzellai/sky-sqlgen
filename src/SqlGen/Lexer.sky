@@ -1,0 +1,468 @@
+module SqlGen.Lexer exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Char as Char
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+
+
+-- ===========================================================================
+-- Character helpers
+-- ===========================================================================
+isSpace : Char -> Bool
+isSpace c =
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+
+isIdentStart : Char -> Bool
+isIdentStart c =
+    Char.isAlpha c || c == '_'
+
+
+isIdentChar : Char -> Bool
+isIdentChar c =
+    Char.isAlpha c || Char.isDigit c || c == '_'
+-- ===========================================================================
+-- Tokenizer  (SQL text -> List Token).  Comments already stripped by splitter.
+-- ===========================================================================
+
+
+lex : String -> List Token
+lex s =
+    lexGo (String.toList s) []
+
+
+lexGo : List Char -> List Token -> List Token
+lexGo chars acc =
+    case chars of
+
+        [] ->
+            List.reverse acc
+
+        c :: rest ->
+            if isSpace c then
+                lexGo rest acc
+
+            else if c == '\'' then
+                let
+                    ( str, rem ) = takeString rest []
+                in
+                    lexGo rem (TStr str :: acc)
+
+            else if c == '"' then
+                let
+                    ( ident, rem ) = takeQuoted rest []
+                in
+                    lexGo rem (TWord ident :: acc)
+
+            else if c == '@' then
+                let
+                    ( name, rem1 ) = takeWhile isIdentChar rest []
+                    ( force, rem2 ) = takeForce rem1
+                in
+                    lexGo rem2 (TParam name force :: acc)
+
+            else if isIdentStart c then
+                let
+                    ( w, rem ) = takeWhile isIdentChar (c :: rest) []
+                in
+                    lexGo rem (TWord w :: acc)
+
+            else if Char.isDigit c then
+                let
+                    ( n, rem ) = takeWhile isNumChar (c :: rest) []
+                in
+                    lexGo rem (TNum n :: acc)
+
+            else
+                let
+                    ( sym, rem ) = takeSym (c :: rest)
+                in
+                    lexGo rem (TSym sym :: acc)
+
+
+isNumChar : Char -> Bool
+isNumChar c =
+    Char.isDigit c || c == '.'
+
+
+takeWhile : (Char -> Bool) -> List Char -> List Char -> ( String, List Char )
+takeWhile pred chars acc =
+    case chars of
+
+        [] ->
+            ( String.fromList (List.reverse acc), [] )
+
+        c :: rest ->
+            if pred c then
+                takeWhile pred rest (c :: acc)
+
+            else
+                ( String.fromList (List.reverse acc), chars )
+
+
+takeForce : List Char -> ( Force, List Char )
+takeForce chars =
+    case chars of
+
+        '!' :: rest ->
+            ( FNotNull, rest )
+
+        '?' :: rest ->
+            ( FNull, rest )
+
+        _ ->
+            ( FNone, chars )
+-- single-quoted string literal; '' is an escaped quote
+
+
+takeString : List Char -> List Char -> ( String, List Char )
+takeString chars acc =
+    case chars of
+
+        [] ->
+            ( String.fromList (List.reverse acc), [] )
+
+        '\'' :: '\'' :: rest ->
+            takeString rest ('\'' :: acc)
+
+        '\'' :: rest ->
+            ( String.fromList (List.reverse acc), rest )
+
+        c :: rest ->
+            takeString rest (c :: acc)
+-- double-quoted identifier
+
+
+takeQuoted : List Char -> List Char -> ( String, List Char )
+takeQuoted chars acc =
+    case chars of
+
+        [] ->
+            ( String.fromList (List.reverse acc), [] )
+
+        '"' :: rest ->
+            ( String.fromList (List.reverse acc), rest )
+
+        c :: rest ->
+            takeQuoted rest (c :: acc)
+-- operators / punctuation, longest-match for two-char ops
+
+
+takeSym : List Char -> ( String, List Char )
+takeSym chars =
+    case chars of
+
+        '<' :: '=' :: rest ->
+            ( "<=", rest )
+
+        '>' :: '=' :: rest ->
+            ( ">=", rest )
+
+        '<' :: '>' :: rest ->
+            ( "<>", rest )
+
+        '!' :: '=' :: rest ->
+            ( "!=", rest )
+
+        '|' :: '|' :: rest ->
+            ( "||", rest )
+
+        c :: rest ->
+            ( String.fromChar c, rest )
+
+        [] ->
+            ( "", [] )
+-- ===========================================================================
+-- Statement splitter  (raw file -> annotated raw statements)
+-- ===========================================================================
+
+type alias SplitState =
+    { line : Int
+    , buf : List Char
+    , stmtLine : Int
+    , pending : Maybe RawAnno
+    , results : List RawStatement
+    }
+
+
+splitStatements : String -> List RawStatement
+splitStatements src =
+    let
+        final =
+            splitGo
+                (String.toList src)
+                { line = 1
+                , buf = []
+                , stmtLine = 0
+                , pending = Nothing
+                , results = []
+                }
+        flushed = flushBuf final
+    in
+        List.reverse flushed.results
+
+
+emptyBuf : List Char -> Bool
+emptyBuf buf =
+    String.trim (String.fromList buf) == ""
+
+
+flushBuf : SplitState -> SplitState
+flushBuf st =
+    if emptyBuf st.buf then
+        st
+-- ===========================================================================
+-- Annotation parsing  (RawAnno -> Annotation)
+-- ===========================================================================
+
+    else
+        { st | results = { anno = st.pending
+          , sql = String.trim (String.fromList (List.reverse st.buf))
+          , line = st.stmtLine
+          }
+              :: st.results
+        , buf = []
+        , stmtLine = 0
+        , pending = Nothing
+        }
+
+
+splitGo : List Char -> SplitState -> SplitState
+splitGo chars st =
+    case chars of
+
+        [] ->
+            st
+
+        '-' :: '-' :: rest ->
+            let
+                ( comment, rem ) = takeWhile (\c -> c /= '\n') rest []
+                st2 = applyComment (String.trim comment) st
+            in
+                splitGo rem st2
+
+        '\n' :: rest ->
+            let
+                st2 =
+                    if st.stmtLine == 0 then
+                        { st | line = st.line + 1 }
+
+                    else
+                        { st | line = st.line + 1, buf = '\n' :: st.buf }
+            in
+                splitGo rest st2
+
+        '\'' :: rest ->
+            let
+                ( str, rem ) = takeString rest []
+                lit = "'" ++ str ++ "'"
+                st2 = appendStr lit (startStmt st)
+            in
+                splitGo rem st2
+
+        ';' :: rest ->
+            let
+                st2 = flushBuf st
+            in
+                splitGo rest st2
+
+        c :: rest ->
+            if isSpace c && st.stmtLine == 0 then
+                splitGo rest st
+
+            else
+                splitGo rest (appendChar c (startStmt st))
+
+
+startStmt : SplitState -> SplitState
+startStmt st =
+    if st.stmtLine == 0 then
+        { st | stmtLine = st.line }
+
+    else
+        st
+
+
+appendChar : Char -> SplitState -> SplitState
+appendChar c st =
+    { st | buf = c :: st.buf }
+
+
+appendStr : String -> SplitState -> SplitState
+appendStr s st =
+    { st | buf = List.append (List.reverse (String.toList s)) st.buf }
+
+
+applyComment : String -> SplitState -> SplitState
+applyComment comment st =
+    if String.startsWith "name:" comment then
+        { st | pending = Just { nameLine = comment, directiveLines = [] } }
+
+    else if String.startsWith "@" comment then
+        case st.pending of
+
+            Just anno ->
+                { st | pending = Just
+                      { anno | directiveLines = List.append anno.directiveLines [comment]
+                      }
+                }
+
+            Nothing ->
+                { st | pending = Just { nameLine = "", directiveLines = [comment] }
+                }
+
+    else
+        st
+
+
+parseAnnotation : RawAnno -> Result Error Annotation
+parseAnnotation raw =
+    case String.words raw.nameLine of
+
+        "name:" :: name :: cardTok :: _ ->
+            case parseCard cardTok of
+
+                Just card ->
+                    parseDirectives raw.directiveLines []
+                        |> Result.map
+                               (\dirs ->
+                                   { name = name
+                                   , card = card
+                                   , directives = dirs
+                                   })
+
+                Nothing ->
+                    Err
+                        (Error.invalidInput ("invalid cardinality: " ++ cardTok))
+
+        _ ->
+            Err
+                (Error.invalidInput
+                    ("malformed name annotation: -- " ++ raw.nameLine))
+
+
+parseCard : String -> Maybe Cardinality
+parseCard tok =
+    if tok == ":one" then
+        Just COne
+
+    else if tok == ":many" then
+        Just CMany
+
+    else if tok == ":exec" then
+        Just CExec
+
+    else if tok == ":execrows" then
+        Just CExecRows
+
+    else if tok == ":scalar" then
+        Just CScalar
+
+    else if tok == ":scalarmany" then
+        Just CScalarMany
+
+    else
+        Nothing
+
+
+parseDirectives : List String -> List Directive -> Result Error (List Directive)
+parseDirectives lines acc =
+    case lines of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        line :: rest ->
+            case parseDirective line of
+
+                Ok d ->
+                    parseDirectives rest (d :: acc)
+
+                Err e ->
+                    Err e
+
+
+parseDirective : String -> Result Error Directive
+parseDirective line =
+    case String.words line of
+
+        "@param" :: name :: typeWords ->
+            parseTypeSpec typeWords |> Result.map (\spec -> DParam name spec)
+
+        "@nullable" :: name :: _ ->
+            Ok (DNullable name)
+
+        "@notnull" :: name :: _ ->
+            Ok (DNotNull name)
+
+        "@model" :: name :: _ ->
+            Ok (DModel name)
+
+        "@omit" :: rest ->
+            case parseOmitCols rest of
+
+                [] ->
+                    Err
+                        (Error.invalidInput
+                            "@omit requires at least one column name (e.g. -- @omit status, note)")
+
+                cols ->
+                    Ok (DOmit cols)
+
+        _ ->
+            Err (Error.invalidInput ("unknown directive: -- " ++ line))
+
+
+-- The omittable column list of an `@omit` directive. Comma-separated; the
+-- words come pre-split on whitespace so commas may cling to a word
+-- (`["status,", "note"]`) — re-join, split on ",", trim, drop empties.
+parseOmitCols : List String -> List String
+parseOmitCols words =
+    List.filter
+        (\x -> not (String.isEmpty x))
+        (List.map String.trim (String.split "," (String.join " " words)))
+
+
+parseTypeSpec : List String -> Result Error TypeSpec
+parseTypeSpec words =
+    case words of
+
+        "Maybe" :: base :: _ ->
+            mapBaseType base |> Result.map (\t -> { base = t, nullable = True })
+
+        base :: _ ->
+            mapBaseType base
+                |> Result.map (\t -> { base = t, nullable = False })
+
+        [] ->
+            Err (Error.invalidInput "@param missing type")
+
+
+mapBaseType : String -> Result Error SkyType
+mapBaseType s =
+    if s == "Int" then
+        Ok TInt
+
+    else if s == "Float" then
+        Ok TFloat
+
+    else if s == "String" then
+        Ok TString
+
+    else if s == "Bool" then
+        Ok TBool
+
+    else if s == "Bytes" then
+        Ok TBytes
+
+    else if s == "Decimal" then
+        Ok TDecimal
+
+    else if s == "Money" then
+        Ok TMoney
+
+    else
+        Err (Error.invalidInput ("unknown Sky type in @param: " ++ s))

@@ -1,0 +1,42 @@
+name: Release
+
+# On a vX.Y.Z tag: cross-compile the generator with the Sky compiler docker
+# image and attach the binaries to a GitHub release, so users don't build locally.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross-compile binaries (Sky compiler docker image)
+        run: |
+          docker run --rm -e GITHUB_REF_NAME="$GITHUB_REF_NAME" \
+            -v "$PWD:/app" -w /app --entrypoint bash anzel/sky:latest -c '
+            set -euo pipefail
+            sky build src/Main.sky          # generates pure-Go output in sky-out/
+            mkdir -p dist
+            cd sky-out
+            for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+              os=${t%/*}; arch=${t#*/}
+              out="../dist/sky-sqlgen-${GITHUB_REF_NAME}-${os}-${arch}"
+              echo "building $out"
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "$out" .
+            done
+          '
+          sudo chown -R "$(id -u):$(id -g)" dist
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -la dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

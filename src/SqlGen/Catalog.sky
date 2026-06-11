@@ -1,0 +1,303 @@
+module SqlGen.Catalog exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Dict as Dict
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+import SqlGen.Naming as Naming
+
+
+empty : Catalog
+empty =
+    { tables = Dict.empty, order = [] }
+
+
+lookup : String -> Catalog -> Maybe CatTable
+lookup name cat =
+    Dict.get (String.toLower name) cat.tables
+-- Tables in declaration order (deterministic; Dict.values order is not).
+
+
+orderedTables : Catalog -> List CatTable
+orderedTables cat =
+    List.filterMap (\k -> Dict.get k cat.tables) cat.order
+-- ---------------------------------------------------------------------------
+-- SQL type spelling -> Sky base type
+-- ---------------------------------------------------------------------------
+
+
+mapSqlType : DecimalMode -> List String -> Result Error SkyType
+mapSqlType decimalMode typeWords =
+    case typeWords of
+
+        [] ->
+            Err (Error.invalidInput "column has no type")
+
+        _ ->
+            let
+                joined = String.toUpper (String.join " " typeWords)
+                head = String.toUpper (firstWord typeWords)
+            in
+                if containsAny [ "INT", "SERIAL" ] head then
+                    Ok TInt
+
+                else if containsAny ["BOOL"] head then
+                    Ok TBool
+
+                else if containsAny
+                    [ "CHAR"
+                    , "TEXT"
+                    , "CLOB"
+                    , "UUID"
+                    , "CITEXT"
+                    , "JSON"
+                    , "ENUM"
+                    , "VARYING"
+                    , "DATE"
+                    , "TIME"
+                    , "TIMESTAMP"
+                    , "DATETIME"
+                    ]
+                    joined then
+                    Ok TString
+
+                else if containsAny [ "BLOB", "BYTEA" ] head then
+                    Ok TBytes
+
+                else if containsAny ["MONEY"] head then
+                    Ok TMoney
+
+                else if containsAny [ "NUMERIC", "DECIMAL", "DEC" ] head then
+                    -- Exact-numeric: lossless Decimal by default, knob can
+                    -- opt down to Float or up to Money.
+                    Ok (decimalModeType decimalMode)
+
+                else if containsAny [ "REAL", "FLOAT", "DOUBLE" ] head then
+                    -- Approximate binary floats stay Float.
+                    Ok TFloat
+
+                else
+                    Err
+                        (Error.invalidInput
+                            ("unknown SQL type: " ++ joined
+                                ++ " (add a [[sqlgen.override]] entry)"))
+
+
+decimalModeType : DecimalMode -> SkyType
+decimalModeType mode =
+    case mode of
+
+        DMDecimal ->
+            TDecimal
+
+        DMFloat ->
+            TFloat
+
+        DMMoney ->
+            TMoney
+
+
+firstWord : List String -> String
+firstWord words =
+    case words of
+
+        w :: _ ->
+            w
+
+        [] ->
+            ""
+
+
+containsAny : List String -> String -> Bool
+containsAny needles haystack =
+    List.any (\n -> String.contains n haystack) needles
+-- ---------------------------------------------------------------------------
+-- [[sqlgen.override]] type overrides — validation
+-- ---------------------------------------------------------------------------
+
+
+parseOverrideType : String -> Result Error SkyType
+parseOverrideType s =
+    if s == "Int" then
+        Ok TInt
+
+    else if s == "Float" then
+        Ok TFloat
+
+    else if s == "String" then
+        Ok TString
+
+    else if s == "Bool" then
+        Ok TBool
+
+    else if s == "Bytes" then
+        Ok TBytes
+
+    else if s == "Decimal" then
+        Ok TDecimal
+
+    else if s == "Money" then
+        Ok TMoney
+
+    else
+        Err
+            (Error.invalidInput
+                ("unknown sky_type override: '" ++ s
+                    ++ "' (expected Int/Float/String/Bool/Bytes/Decimal/Money)"))
+-- Validate the raw override list into a "table.col" -> SkyType dict.
+
+
+validateOverrides : List ColumnOverride -> Result Error (Dict String SkyType)
+validateOverrides overrides =
+    validateOverridesGo overrides Dict.empty
+
+
+validateOverridesGo : List ColumnOverride -> Dict String SkyType -> Result Error (Dict String SkyType)
+validateOverridesGo overrides acc =
+    case overrides of
+
+        [] ->
+            Ok acc
+
+        o :: rest ->
+            if String.isEmpty o.table then
+                Err
+                    (Error.invalidInput
+                        ("[[sqlgen.override]] column must be 'table.column'; got '"
+                            ++ o.column
+                            ++ "'"))
+
+            else
+                case parseOverrideType o.skyTypeRaw of
+
+                    Err e ->
+                        Err e
+
+                    Ok t ->
+                        let
+                            okey =
+                                String.toLower o.table ++ "."
+                                    ++ String.toLower o.column
+                        in
+                            validateOverridesGo rest (Dict.insert okey t acc)
+-- ---------------------------------------------------------------------------
+-- Build catalog from parsed CREATE TABLE statements
+-- ---------------------------------------------------------------------------
+
+
+build : CatalogOpts -> List CreateTable -> Result Error Catalog
+build opts creates =
+    buildGo opts creates empty
+
+
+buildGo : CatalogOpts -> List CreateTable -> Catalog -> Result Error Catalog
+buildGo opts creates cat =
+    case creates of
+
+        [] ->
+            Ok cat
+
+        ct :: rest ->
+            case addTable opts ct cat of
+
+                Err e ->
+                    Err e
+
+                Ok cat2 ->
+                    buildGo opts rest cat2
+
+
+addTable : CatalogOpts -> CreateTable -> Catalog -> Result Error Catalog
+addTable opts ct cat =
+    let
+        key = String.toLower ct.name
+    in
+        if Dict.member key cat.tables then
+            Err (Error.invalidInput ("duplicate table definition: " ++ ct.name))
+
+        else
+            case buildColumns opts key ct [] of
+
+                Err e ->
+                    Err e
+
+                Ok cols ->
+                    let
+                        model =
+                            case Dict.get key opts.modelOverrides of
+
+                                Just m ->
+                                    m
+
+                                Nothing ->
+                                    Naming.modelName opts.singularize ct.name
+                        table =
+                            { name = ct.name
+                            , modelName = model
+                            , decoderName = Naming.decoderName model
+                            , columns = cols
+                            }
+                    in
+                        Ok
+                            { cat | tables = Dict.insert key table cat.tables
+                            , order = List.append cat.order [key]
+                            }
+
+
+buildColumns : CatalogOpts -> String -> CreateTable -> List CatColumn -> Result Error (List CatColumn)
+buildColumns opts tableKey ct acc =
+    buildColumnsGo opts tableKey ct.pkCols ct.uniqueCols ct.columns acc
+
+
+buildColumnsGo : CatalogOpts -> String -> List String -> List String -> List ParsedColumn -> List CatColumn -> Result Error (List CatColumn)
+buildColumnsGo opts tableKey pkCols uniqueCols cols acc =
+    case cols of
+
+        [] ->
+            Ok (List.reverse acc)
+
+        c :: rest ->
+            case columnType opts tableKey c of
+
+                Err e ->
+                    Err e
+
+                Ok ty ->
+                    let
+                        isPk = c.primaryKey || List.member c.name pkCols
+                        nullable = not (c.notNull || isPk)
+                        isUnique = c.unique || List.member c.name uniqueCols
+                        catCol =
+                            { name = c.name
+                            , skyType = ty
+                            , nullable = nullable
+                            , isPrimaryKey = isPk
+                            , unique = isUnique
+                            , hasDefault = c.hasDefault
+                            }
+                    in
+                        buildColumnsGo
+                            opts
+                            tableKey
+                            pkCols
+                            uniqueCols
+                            rest
+                            (catCol :: acc)
+-- A column's resolved type: a matching [[sqlgen.override]] wins over the
+-- default SQL-type mapping.
+
+
+columnType : CatalogOpts -> String -> ParsedColumn -> Result Error SkyType
+columnType opts tableKey c =
+    let
+        okey = tableKey ++ "." ++ String.toLower c.name
+    in
+        case Dict.get okey opts.typeOverrides of
+
+            Just t ->
+                Ok t
+
+            Nothing ->
+                mapSqlType opts.decimalMode c.typeWords

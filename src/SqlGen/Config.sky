@@ -1,0 +1,404 @@
+module SqlGen.Config exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Task as Task
+import Sky.Core.File as File
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+
+
+defaultConfig : Config
+defaultConfig =
+    { dialect = DSqlite
+    , schema = ["sql/schema.sql"]
+    , queries = ["sql/*.sql"]
+    , out = "src/Gen"
+    , modulePrefix = "Gen"
+    , singularize = True
+    , verify = True
+    , decimalAs = DMDecimal
+    , overrides = []
+    }
+-- ---------------------------------------------------------------------------
+-- Load config from sky.toml (best-effort; missing keys keep defaults)
+-- ---------------------------------------------------------------------------
+
+
+load : String -> Task Error Config
+load path =
+    File.exists path
+        |> Task.andThen
+               (\present ->
+                   if present then
+                       File.readFile path |> Task.map parseToml
+
+                   else
+                       Task.succeed defaultConfig)
+-- TOML reader state. `pend*` accumulate the in-flight `[[sqlgen.override]]`
+-- block; it is flushed into config.overrides on the next section header or EOF.
+
+type alias TomlState =
+    { section : String
+    , pendCol : String
+    , pendType : String
+    , pendActive : Bool
+    , config : Config
+    }
+
+
+parseToml : String -> Config
+parseToml content =
+    let
+        st0 =
+            { section = ""
+            , pendCol = ""
+            , pendType = ""
+            , pendActive = False
+            , config = defaultConfig
+            }
+        final = parseLines (String.lines content) st0
+    in
+        (flushPending final).config
+
+
+parseLines : List String -> TomlState -> TomlState
+parseLines lines st =
+    case lines of
+
+        [] ->
+            st
+
+        line :: rest ->
+            let
+                trimmed = String.trim (stripComment line)
+            in
+                if String.isEmpty trimmed then
+                    parseLines rest st
+-- Flush the in-flight override (if any), then switch to the new section.
+
+                else if String.startsWith "[" trimmed then
+                    parseLines rest (startSection (sectionName trimmed) st)
+
+                else if st.section == "sqlgen" then
+                    parseLines rest { st | config = applyKey trimmed st.config }
+
+                else if st.section == "sqlgen.override" then
+                    parseLines rest (applyOverrideKey trimmed st)
+
+                else
+                    parseLines rest st
+
+
+startSection : String -> TomlState -> TomlState
+startSection newSec st =
+    let
+        flushed = flushPending st
+    in
+        { flushed | section = newSec
+        , pendCol = ""
+        , pendType = ""
+        , pendActive = newSec == "sqlgen.override"
+        }
+
+
+flushPending : TomlState -> TomlState
+flushPending st =
+    if st.pendActive && not (String.isEmpty st.pendCol) then
+        { st | config = addOverride st.pendCol st.pendType st.config }
+
+    else
+        st
+
+
+addOverride : String -> String -> Config -> Config
+addOverride colSpec typeStr config =
+    let
+        ( table, column ) = splitColumnSpec colSpec
+        ov = { table = table, column = column, skyTypeRaw = typeStr }
+    in
+        { config | overrides = List.append config.overrides [ov] }
+-- "table.col" -> (table, col); a missing dot leaves table empty (caught later).
+
+
+splitColumnSpec : String -> ( String, String )
+splitColumnSpec spec =
+    case String.split "." spec of
+
+        [t, c] ->
+            ( t, c )
+
+        _ ->
+            ( "", spec )
+
+
+applyOverrideKey : String -> TomlState -> TomlState
+applyOverrideKey line st =
+    case String.split "=" line of
+
+        key :: valueParts ->
+            let
+                k = String.trim key
+                v = unquote (String.trim (String.join "=" valueParts))
+            in
+                if k == "column" then
+                    { st | pendCol = v }
+
+                else if k == "sky_type" then
+                    { st | pendType = v }
+
+                else
+                    st
+
+        [] ->
+            st
+
+
+stripComment : String -> String
+stripComment line =
+    case String.split "#" line of
+
+        first :: _ ->
+            first
+
+        [] ->
+            line
+
+
+sectionName : String -> String
+sectionName s =
+    String.trim (String.replace "]" "" (String.replace "[" "" s))
+
+
+applyKey : String -> Config -> Config
+applyKey line config =
+    case String.split "=" line of
+
+        key :: valueParts ->
+            let
+                k = String.trim key
+                v = String.trim (String.join "=" valueParts)
+            in
+                setKey k v config
+
+        [] ->
+            config
+
+
+setKey : String -> String -> Config -> Config
+setKey key value config =
+    if key == "dialect" then
+        { config | dialect = parseDialect (unquote value) }
+
+    else if key == "schema" then
+        { config | schema = parseArray value }
+
+    else if key == "queries" then
+        { config | queries = parseArray value }
+
+    else if key == "out" then
+        { config | out = unquote value }
+
+    else if key == "module" then
+        { config | modulePrefix = unquote value }
+
+    else if key == "singularize" then
+        { config | singularize = value == "true" }
+
+    else if key == "verify" then
+        { config | verify = value == "true" }
+
+    else if key == "decimal_as" then
+        { config | decimalAs = parseDecimalMode (unquote value) }
+
+    else
+        config
+
+
+parseDecimalMode : String -> DecimalMode
+parseDecimalMode s =
+    let
+        lowered = String.toLower s
+    in
+        if lowered == "float" then
+            DMFloat
+
+        else if lowered == "money" then
+            DMMoney
+
+        else
+            DMDecimal
+
+
+parseDialect : String -> Dialect
+parseDialect s =
+    if String.toLower s == "postgres" then
+        DPostgres
+
+    else
+        DSqlite
+
+
+unquote : String -> String
+unquote s =
+    let
+        t = String.trim s
+    in
+        if String.startsWith "\"" t && String.endsWith "\"" t && String.length t
+            >= 2 then
+            String.slice 1 (String.length t - 1) t
+
+        else
+            t
+
+
+parseArray : String -> List String
+parseArray value =
+    let
+        inner =
+            String.replace "]" "" (String.replace "[" "" (String.trim value))
+    in
+        List.filterMap
+            (\part ->
+                let
+                    p = unquote (String.trim part)
+                in
+                    if String.isEmpty p then
+                        Nothing
+
+                    else
+                        Just p)
+            (String.split "," inner)
+-- ---------------------------------------------------------------------------
+-- Glob discovery
+-- ---------------------------------------------------------------------------
+
+
+expandGlobs : List String -> Task Error (List String)
+expandGlobs patterns =
+    case patterns of
+
+        [] ->
+            Task.succeed []
+
+        p :: rest ->
+            expandGlob p
+                |> Task.andThen
+                       (\paths ->
+                           expandGlobs rest
+                               |> Task.map
+                                      (\more ->
+                                          dedupStrings (List.append paths more)))
+
+
+dedupStrings : List String -> List String
+dedupStrings items =
+    dedupStringsGo items []
+
+
+dedupStringsGo : List String -> List String -> List String
+dedupStringsGo items seen =
+    case items of
+
+        [] ->
+            List.reverse seen
+
+        x :: rest ->
+            if List.member x seen then
+                dedupStringsGo rest seen
+
+            else
+                dedupStringsGo rest (x :: seen)
+
+
+expandGlob : String -> Task Error (List String)
+expandGlob pattern =
+    if String.contains "*" pattern then
+        let
+            dir = dirOf pattern
+            filePat = baseOf pattern
+        in
+            File.readDir dir
+                |> Task.map
+                       (\names ->
+                           List.map
+                               (\n -> joinPath dir n)
+                               (List.filter (\n -> matchStar filePat n) names))
+
+    else
+        File.exists pattern
+            |> Task.map
+                   (\present ->
+                       if present then
+                           [pattern]
+
+                       else
+                           [])
+
+
+dirOf : String -> String
+dirOf path =
+    case List.reverse (String.split "/" path) of
+
+        _ :: revInit ->
+            if List.isEmpty revInit then
+                "."
+
+            else
+                String.join "/" (List.reverse revInit)
+
+        [] ->
+            "."
+
+
+baseOf : String -> String
+baseOf path =
+    case List.reverse (String.split "/" path) of
+
+        last :: _ ->
+            last
+
+        [] ->
+            path
+
+
+joinPath : String -> String -> String
+joinPath dir name =
+    if dir == "." then
+        name
+
+    else
+        dir ++ "/" ++ name
+-- match a simple "prefix*suffix" pattern (one star) against a filename
+
+
+matchStar : String -> String -> Bool
+matchStar pattern name =
+    case String.split "*" pattern of
+
+        [prefix, suffix] ->
+            String.startsWith prefix name && String.endsWith suffix name
+                && String.length name
+                >= (String.length prefix + String.length suffix)
+
+        _ ->
+            pattern == name
+
+
+readFiles : List String -> Task Error (List FileContent)
+readFiles paths =
+    case paths of
+
+        [] ->
+            Task.succeed []
+
+        p :: rest ->
+            File.readFile p
+                |> Task.andThen
+                       (\content ->
+                           readFiles rest
+                               |> Task.map
+                                      (\more ->
+                                          { path = p, content = content }
+                                              :: more))

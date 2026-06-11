@@ -1,0 +1,12 @@
+sky-out/
+.skycache/
+.skydeps/
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# regenerable Sky template (sky upgrade-claude) + OS cruft
+CLAUDE.md
+.DS_Store
+*.bak

@@ -1,0 +1,12 @@
+# Standalone config for the aggregate-projection example (sql/reports.sql).
+# Kept separate from sky.toml so the default users.sql run stays
+# byte-identical.
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/reports.sql"]
+queries     = ["sql/reports.sql"]
+out         = "src/GenReports"
+module      = "GenReports"
+singularize = true
+verify      = true

@@ -1,0 +1,376 @@
+module Main exposing (main)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Task as Task
+import Sky.Core.File as File
+import Sky.Core.System as System
+import Sky.Core.Process as Process
+import Sky.Core.Error as Error exposing (Error)
+import SqlGen.Types exposing (..)
+import SqlGen.Config as Config
+import SqlGen.Pipeline as Pipeline
+import Std.Log as Log exposing (println)
+
+
+version : String
+version =
+    "sky-sqlgen 0.1.0"
+
+type alias Flags =
+    { configPath : String
+    , dryRun : Bool
+    , noVerify : Bool
+    , showVersion : Bool
+    , check : Bool
+    }
+
+
+defaultFlags : Flags
+defaultFlags =
+    { configPath = "sky.toml"
+    , dryRun = False
+    , noVerify = False
+    , showVersion = False
+    , check = False
+    }
+
+
+parseFlags : List String -> Flags
+parseFlags args =
+    parseFlagsGo args defaultFlags
+
+
+parseFlagsGo : List String -> Flags -> Flags
+parseFlagsGo args flags =
+    case args of
+
+        [] ->
+            flags
+
+        "--dry-run" :: rest ->
+            parseFlagsGo rest { flags | dryRun = True }
+
+        "--no-verify" :: rest ->
+            parseFlagsGo rest { flags | noVerify = True }
+
+        "--check" :: rest ->
+            parseFlagsGo rest { flags | check = True }
+
+        "--version" :: rest ->
+            parseFlagsGo rest { flags | showVersion = True }
+
+        "--config" :: path :: rest ->
+            parseFlagsGo rest { flags | configPath = path }
+
+        _ :: rest ->
+            parseFlagsGo rest flags
+-- ---------------------------------------------------------------------------
+-- Pipeline orchestration
+-- ---------------------------------------------------------------------------
+
+
+generate : Flags -> Task Error ()
+generate flags =
+    Config.load flags.configPath
+        |> Task.andThen
+               (\config ->
+                   Config.expandGlobs config.schema
+                       |> Task.andThen
+                              (\schemaPaths ->
+                                  Config.expandGlobs config.queries
+                                      |> Task.andThen
+                                             (\queryPaths ->
+                                                 loadAndRun
+                                                     flags
+                                                     config
+                                                     schemaPaths
+                                                     queryPaths)))
+
+
+loadAndRun : Flags -> Config -> List String -> List String -> Task Error ()
+loadAndRun flags config schemaPaths queryPaths =
+    Config.readFiles schemaPaths
+        |> Task.andThen
+               (\schemaFiles ->
+                   Config.readFiles queryPaths
+                       |> Task.andThen
+                              (\queryFiles ->
+                                  case Pipeline.run
+                                           config
+                                           schemaFiles
+                                           queryFiles of
+
+                                      Err e ->
+                                          Task.fail e
+
+                                      Ok out ->
+                                          writeOutput flags config out))
+
+
+writeOutput : Flags -> Config -> GenOutput -> Task Error ()
+writeOutput flags config out =
+    let
+        files = out.schema :: out.modules
+        _ = printWarnings out.warnings
+        _ = forcePrintln (summaryLine out)
+    in
+        if flags.check then
+            checkDrift files
+
+        else if flags.dryRun then
+            let
+                _ =
+                    List.foldl
+                        (\f _ -> forcePrintln ("would write: " ++ f.path))
+                        ()
+-- ---------------------------------------------------------------------------
+-- --check : drift gate (CI). Regenerate, sky-fmt-normalise each generated
+-- source in a temp dir, diff against the committed file. Exit 1 on any drift
+-- (stale / missing). Never writes to the real output tree.
+-- ---------------------------------------------------------------------------
+                        files
+            in
+                Task.succeed ()
+
+        else
+            File.mkdirAll config.out |> Task.andThen (\_ -> writeAll files)
+                |> Task.andThen
+                       (\_ ->
+                           if config.verify && not flags.noVerify then
+                               verifyAll out.modules
+
+                           else
+                               let
+                                   _ =
+                                       println
+                                           ("Generated "
+                                               ++ String.fromInt
+                                                      (List.length files)
+                                               ++ " file(s) into "
+                                               ++ config.out)
+                               in
+                                   Task.succeed ())
+
+
+forcePrintln : String -> ()
+forcePrintln s =
+    let
+        _ = println s
+    in
+        ()
+-- Per-skip warnings go to stderr (Std.Log.warn); the run still succeeds.
+
+
+printWarnings : List String -> ()
+printWarnings ws =
+    List.foldl (\w _ -> forceWarn w) () ws
+
+
+forceWarn : String -> ()
+forceWarn s =
+    let
+        _ = Log.warn s
+    in
+        ()
+
+
+summaryLine : GenOutput -> String
+summaryLine out =
+    "generated " ++ String.fromInt out.generated ++ " function(s), skipped "
+        ++ String.fromInt (List.length out.warnings)
+
+
+baseName : String -> String
+baseName path =
+    case List.reverse (String.split "/" path) of
+
+        last :: _ ->
+            last
+
+        [] ->
+            path
+
+
+normalizeGenerated : String -> SourceFile -> Task Error String
+normalizeGenerated dir f =
+    let
+        tmpPath = dir ++ "/" ++ baseName f.path
+    in
+        File.writeFile tmpPath f.source
+            |> Task.andThen (\_ -> Process.run "sky" [ "fmt", tmpPath ])
+            |> Task.andThen (\_ -> File.readFile tmpPath)
+
+
+checkDrift : List SourceFile -> Task Error ()
+checkDrift files =
+    File.tempDir "sqlgen-check"
+        |> Task.andThen
+               (\dir ->
+                   checkDriftGo dir files []
+                       |> Task.andThen (\_ -> cleanupTemp dir files))
+-- Remove the per-file temp copies then the temp dir itself (best-effort;
+-- failures are swallowed since the drift verdict has already been reported).
+
+
+cleanupTemp : String -> List SourceFile -> Task Error ()
+cleanupTemp dir files =
+    case files of
+
+        [] ->
+            File.remove dir |> Task.onError (\_ -> Task.succeed ())
+
+        f :: rest ->
+            File.remove (dir ++ "/" ++ baseName f.path)
+                |> Task.onError (\_ -> Task.succeed ())
+                |> Task.andThen (\_ -> cleanupTemp dir rest)
+
+
+checkDriftGo : String -> List SourceFile -> List String -> Task Error ()
+checkDriftGo dir files drifts =
+    case files of
+
+        [] ->
+            finishCheck (List.reverse drifts)
+
+        f :: rest ->
+            normalizeGenerated dir f
+                |> Task.andThen
+                       (\normalized ->
+                           File.readFile f.path
+                               |> Task.andThen
+                                      (\committed ->
+                                          if committed == normalized then
+                                              let
+                                                  _ =
+                                                      println
+                                                          ("  ok    " ++ f.path)
+                                              in
+                                                  checkDriftGo dir rest drifts
+
+                                          else
+                                              let
+                                                  _ =
+                                                      println
+                                                          ("  DRIFT " ++ f.path)
+                                              in
+                                                  checkDriftGo
+                                                      dir
+                                                      rest
+                                                      (f.path :: drifts))
+                               |> Task.onError
+                                      (\_ ->
+                                          let
+                                              _ =
+                                                  println
+                                                      ("  MISSING " ++ f.path)
+                                          in
+                                              checkDriftGo
+                                                  dir
+                                                  rest
+                                                  (f.path :: drifts)))
+
+
+finishCheck : List String -> Task Error ()
+finishCheck drifts =
+    if List.isEmpty drifts then
+        let
+            _ = println "check: generated output is up to date (no drift)"
+        in
+            Task.succeed ()
+
+    else
+        let
+            _ =
+                println
+                    ("check: " ++ String.fromInt (List.length drifts)
+                        ++ " file(s) stale or missing — re-run sqlgen and commit the output")
+        in
+            System.exit 1
+
+
+writeAll : List SourceFile -> Task Error ()
+writeAll files =
+    case files of
+
+        [] ->
+            Task.succeed ()
+
+        f :: rest ->
+            File.writeFile f.path f.source
+                |> Task.andThen (\_ -> fmtFile f.path)
+                |> Task.andThen
+                       (\_ ->
+                           let
+                               _ = println ("wrote " ++ f.path)
+                           in
+                               writeAll rest)
+
+
+fmtFile : String -> Task Error ()
+fmtFile path =
+    Process.run "sky" [ "fmt", path ] |> Task.map (\_ -> ())
+
+
+verifyAll : List SourceFile -> Task Error ()
+verifyAll files =
+    case files of
+
+        [] ->
+            let
+                _ = println "verify: all generated modules pass sky check"
+            in
+                Task.succeed ()
+
+        f :: rest ->
+            Process.run "sky" [ "check", f.path ]
+                |> Task.andThen
+                       (\output ->
+                           if String.contains "No errors found" output then
+                               let
+                                   _ = println ("verify ok: " ++ f.path)
+                               in
+                                   verifyAll rest
+
+                           else
+                               Task.fail
+                                   (Error.invalidInput
+                                       ("verify failed for " ++ f.path ++ ":\n"
+                                           ++ output)))
+-- ---------------------------------------------------------------------------
+-- Entry
+-- ---------------------------------------------------------------------------
+
+
+run : Task Error ()
+run =
+    System.args ()
+        |> Task.andThen
+               (\args ->
+                   let
+                       flags = parseFlags args
+                   in
+                       if flags.showVersion then
+                           let
+                               _ = println version
+                           in
+                               Task.succeed ()
+
+                       else
+                           generate flags)
+
+
+main =
+    let
+        _ = Task.run (run |> Task.onError reportError)
+    in
+        ()
+
+
+reportError : Error -> Task Error ()
+reportError e =
+    let
+        _ = println ("sqlgen: error: " ++ Error.toString e)
+    in
+        System.exit 1

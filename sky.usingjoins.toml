@@ -1,0 +1,10 @@
+# Standalone config for the USING-join example (sql/usingjoins.sql).
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/usingjoins.sql"]
+queries     = ["sql/usingjoins.sql"]
+out         = "src/GenUsingJoins"
+module      = "GenUsingJoins"
+singularize = true
+verify      = true

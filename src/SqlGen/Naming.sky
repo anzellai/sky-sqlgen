@@ -1,0 +1,178 @@
+module SqlGen.Naming exposing (..)
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.List as List
+
+
+upperFirst : String -> String
+upperFirst s =
+    if String.isEmpty s then
+        s
+
+    else
+        String.toUpper (String.slice 0 1 s)
+            ++ String.slice 1 (String.length s) s
+
+
+lowerFirst : String -> String
+lowerFirst s =
+    if String.isEmpty s then
+        s
+
+    else
+        String.toLower (String.slice 0 1 s)
+            ++ String.slice 1 (String.length s) s
+
+
+capitalize : String -> String
+capitalize seg =
+    upperFirst (String.toLower seg)
+
+
+segments : String -> List String
+segments s =
+    List.filter (\x -> not (String.isEmpty x)) (String.split "_" s)
+
+
+snakeToCamel : String -> String
+snakeToCamel s =
+    case segments s of
+
+        [] ->
+            s
+
+        first :: rest ->
+            String.toLower first ++ String.concat (List.map capitalize rest)
+
+
+snakeToPascal : String -> String
+snakeToPascal s =
+    upperFirst (snakeToCamel s)
+
+
+-- ---------------------------------------------------------------------------
+-- Singularisation (small exception list + naive rules)
+-- ---------------------------------------------------------------------------
+singularizeWord : String -> String
+singularizeWord w =
+    let
+        lw = String.toLower w
+    in
+        if lw == "people" then
+            "person"
+
+        else if lw == "children" then
+            "child"
+
+        else if lw == "data" then
+            "datum"
+
+        else if lw == "men" then
+            "man"
+
+        else if lw == "women" then
+            "woman"
+
+        else if lw == "mice" then
+            "mouse"
+
+        else if lw == "feet" then
+            "foot"
+
+        else if lw == "teeth" then
+            "tooth"
+
+        else if lw == "geese" then
+            "goose"
+
+        else if String.endsWith "ies" w && String.length w > 3 then
+            String.slice 0 (String.length w - 3) w ++ "y"
+
+        else if endsWithAny [ "ches", "shes", "sses", "xes", "zes" ] w then
+            String.slice 0 (String.length w - 2) w
+
+        else if String.endsWith "ss" w then
+            w
+
+        else if String.endsWith "s" w && String.length w > 1 then
+            String.slice 0 (String.length w - 1) w
+
+        else
+            w
+
+
+endsWithAny : List String -> String -> Bool
+endsWithAny suffixes s =
+    List.any (\suf -> String.endsWith suf s) suffixes
+
+
+singularizeTable : String -> String
+singularizeTable table =
+    case List.reverse (segments table) of
+
+        last :: revInit ->
+            String.join "_" (List.reverse (singularizeWord last :: revInit))
+
+        [] ->
+            table
+
+
+-- ---------------------------------------------------------------------------
+-- Derived names
+-- ---------------------------------------------------------------------------
+modelName : Bool -> String -> String
+modelName singularize table =
+    if singularize then
+        snakeToPascal (singularizeTable table)
+
+    else
+        snakeToPascal table
+
+
+decoderName : String -> String
+decoderName model =
+    lowerFirst model ++ "Decoder"
+
+
+fieldName : String -> String
+fieldName col =
+    reservedGuard (snakeToCamel col)
+
+
+fnName : String -> String
+fnName base =
+    reservedGuard (lowerFirst base)
+
+
+reservedGuard : String -> String
+reservedGuard name =
+    if List.member name reservedWords then
+        name ++ "_"
+
+    else
+        name
+
+
+reservedWords : List String
+reservedWords =
+    [ "type"
+    , "alias"
+    , "module"
+    , "import"
+    , "exposing"
+    , "as"
+    , "case"
+    , "of"
+    , "let"
+    , "in"
+    , "if"
+    , "then"
+    , "else"
+    , "port"
+    , "where"
+    , "true"
+    , "false"
+    , "null"
+    , "main"
+    ]

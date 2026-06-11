@@ -1,0 +1,10 @@
+# Standalone config for the :scalar / :scalarmany example (sql/scalars.sql).
+
+[sqlgen]
+dialect     = "sqlite"
+schema      = ["sql/scalars.sql"]
+queries     = ["sql/scalars.sql"]
+out         = "src/GenScalars"
+module      = "GenScalars"
+singularize = true
+verify      = true
