@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+# Pinned Sky compiler image. A new Sky tag must not silently change what CI
+# builds. Move the tag and the digest together to change Sky release.
+env:
+  SKY_IMAGE: anzel/sky:0.26.1@sha256:f203750f5f5dc4db7cf3540defcdd0df771bbca158d8d70b5e51276d6b586db2
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -19,7 +24,7 @@ jobs:
       - name: Cross-compile binaries (Sky compiler docker image)
         run: |
           docker run --rm -e GITHUB_REF_NAME="$GITHUB_REF_NAME" -e GOFLAGS=-buildvcs=false \
-            -v "$PWD:/app" -w /app --entrypoint bash anzel/sky:latest -c '
+            -v "$PWD:/app" -w /app --entrypoint bash "$SKY_IMAGE" -c '
             set -euo pipefail
             sky build src/Main.sky          # generates pure-Go output in sky-out/
             mkdir -p dist
