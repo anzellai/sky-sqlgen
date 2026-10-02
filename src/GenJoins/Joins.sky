@@ -9,7 +9,6 @@ import Std.Db as Db
 import Std.Db.Decode as DbDecode
 
 -- ListUsersWithBio :many
--- ListUsersWithBioInner :many
 type alias ListUsersWithBioRow =
     { userId : Int
     , name : String
@@ -41,7 +40,7 @@ listUsersWithBio : Db -> Task Error (List ListUsersWithBioRow)
 listUsersWithBio db =
     Db.queryDecode db listUsersWithBioSql [] listUsersWithBioRowDecoder
 
--- GetUserProfile :one
+-- ListUsersWithBioInner :many
 type alias ListUsersWithBioInnerRow =
     { userId : Int
     , name : String
@@ -73,6 +72,7 @@ listUsersWithBioInner db =
         []
         listUsersWithBioInnerRowDecoder
 
+-- GetUserProfile :one
 type alias GetUserProfileRow =
     { userId : Int
     , name : String
@@ -106,6 +106,6 @@ getUserProfile db params =
     Db.queryDecode
         db
         getUserProfileSql
-        [Db.SqlInt params.id]
+        [ Db.SqlInt params.id ]
         getUserProfileRowDecoder
         |> Task.map List.head

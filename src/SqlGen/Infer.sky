@@ -14,7 +14,6 @@ import SqlGen.Parser as Parser
 -- ===========================================================================
 -- Entry
 -- ===========================================================================
-
 -- ===========================================================================
 -- Scope-aware adjacency typing (SELECT with FROM + JOINs, WHERE / ON)
 -- ===========================================================================
@@ -25,7 +24,6 @@ import SqlGen.Parser as Parser
 --   prevWord  the last word seen (a potential `t.` qualifier OR a column)
 --   dotArmed  we just saw `prevWord .`, so the next word is `prevWord.col`
 -- Type of a (possibly qualified) column in scope; Nothing if unknown/ambiguous.
-
 -- ===========================================================================
 -- Multi-table scope (FROM + JOINs) with outer-join nullability demotion
 -- ===========================================================================
@@ -96,24 +94,35 @@ infer dialect cat prep =
                                                                                 listNames
                                                                                 prep.rawSql
                                                                     in
-                                                                        { baseName = anno.name
-                                                                        , fnName = Naming.fnName
-                                                                              anno.name
-                                                                        , card = anno.card
-                                                                        , sql = rewritePlaceholders
-                                                                              dialect
-                                                                              prep.rawSql
-                                                                        , params = omitR.params
-                                                                        , argOrder = List.map
-                                                                              (\o ->
-                                                                                  Naming.fieldName
-                                                                                      o.name)
-                                                                              occs
-                                                                        , result = result
-                                                                        , sqlChunks = chunks.chunks
-                                                                        , sqlListFields = chunks.listFields
-                                                                        , insertCols = omitR.insertCols
-                                                                        , insertTable = omitR.insertTable
+                                                                        { baseName =
+                                                                            anno.name
+                                                                        , fnName =
+                                                                            Naming.fnName
+                                                                                anno.name
+                                                                        , card =
+                                                                            anno.card
+                                                                        , sql =
+                                                                            rewritePlaceholders
+                                                                                dialect
+                                                                                prep.rawSql
+                                                                        , params =
+                                                                            omitR.params
+                                                                        , argOrder =
+                                                                            List.map
+                                                                                (\o ->
+                                                                                    Naming.fieldName
+                                                                                        o.name)
+                                                                                occs
+                                                                        , result =
+                                                                            result
+                                                                        , sqlChunks =
+                                                                            chunks.chunks
+                                                                        , sqlListFields =
+                                                                            chunks.listFields
+                                                                        , insertCols =
+                                                                            omitR.insertCols
+                                                                        , insertTable =
+                                                                            omitR.insertTable
                                                                         }))))
 
 type alias OmitResult =
@@ -135,10 +144,10 @@ omitNames dirs =
                 _ ->
                     [])
         dirs
+
+
 -- @omit is only meaningful on an INSERT. With a RETURNING clause it emits
 -- Db.insertFieldsReturning; without one, Db.insertFields.
-
-
 omitStmtCheck : List String -> ParsedStmt -> Result Error ()
 omitStmtCheck omits parsed =
     if List.isEmpty omits then
@@ -185,15 +194,16 @@ resolveInsertOmit cat ins omits distinct params =
                            buildInsertCols ins.columns distinct params omits []
                                |> Result.map
                                       (\cols ->
-                                          { params = markOmitParams omits cols params
+                                          { params =
+                                              markOmitParams omits cols params
                                           , insertCols = cols
                                           , insertTable = ins.table
                                           }))
+
+
 -- Each @omit column must (a) be one of the INSERT's columns and (b) either be
 -- nullable or carry a DEFAULT — omitting a NOT NULL column with no DEFAULT
 -- always violates NOT NULL, so loud-fail.
-
-
 checkOmitColumns : List String -> InsertStmt -> CatTable -> Result Error ()
 checkOmitColumns omits ins table =
     case omits of
@@ -263,7 +273,10 @@ buildInsertCols cols names params omits acc =
                             , field = field
                             , skyType = p.skyType
                             , nullable = p.nullable
-                            , omittable = List.member (String.toLower col) (lowerAll omits)
+                            , omittable =
+                                List.member
+                                    (String.toLower col)
+                                    (lowerAll omits)
                             }
                                 :: acc)
 
@@ -290,10 +303,10 @@ markOmitParams omits cols params =
                 cols
     in
         List.map (\p -> setParamOmit (List.member p.field omitFields) p) params
+
+
 -- Construct a fresh record (not `{ p | isOmit = … }`) — a record-update inside
 -- List.map narrows the element type and zeroes the other fields here.
-
-
 setParamOmit : Bool -> ResolvedParam -> ResolvedParam
 setParamOmit omit p =
     { field = p.field
@@ -342,13 +355,13 @@ firstForce name occs =
 
         Nothing ->
             FNone
+
+
 -- ===========================================================================
 -- IN (@list) detection
 -- A param is a LIST param iff it appears as the sole argument of `IN (...)`:
 -- `col IN (@ids)`. It is then typed `List <base>` and expanded at runtime.
 -- ===========================================================================
-
-
 upperWordTok : Token -> String
 upperWordTok t =
     case t of
@@ -378,14 +391,14 @@ collectInList tokens acc =
 
                     Nothing ->
                         collectInList rest acc
--- The three matchers below are split into single-element cons steps. The
--- nested-cons lowering bug that originally forced this (IMPL-PUSHBACK §7.6)
--- was fixed upstream in #583; the stepwise form is kept by choice for clarity.
 
             else
                 collectInList rest acc
 
 
+-- The three matchers below are split into single-element cons steps. The
+-- nested-cons lowering bug that originally forced this (IMPL-PUSHBACK §7.6)
+-- was fixed upstream in #583; the stepwise form is kept by choice for clarity.
 matchInParenOpen : List Token -> Maybe String
 matchInParenOpen tokens =
     case tokens of
@@ -396,17 +409,17 @@ matchInParenOpen tokens =
 
             else
                 Nothing
--- ===========================================================================
--- Result column inference
--- ===========================================================================
 
         [] ->
             Nothing
+
+
+-- ===========================================================================
+-- Result column inference
+-- ===========================================================================
 -- ===========================================================================
 -- Placeholder rewrite
 -- ===========================================================================
-
-
 matchInParenParam : List Token -> Maybe String
 matchInParenParam tokens =
     case tokens of
@@ -448,9 +461,9 @@ isSymTok s t =
 
         _ ->
             False
+
+
 -- Determine the list params (sqlite-only), rejecting mixed list/scalar usage.
-
-
 listParamCheck : Dialect -> List ParamOcc -> List Token -> Result Error (List String)
 listParamCheck dialect occs tokens =
     let
@@ -567,9 +580,11 @@ chunkGo listNames chars st =
                     chunkGo
                         listNames
                         rem2
-                        { st | chunks = flushChunk st.buf st.chunks
-                        , listFields = Naming.fieldName name :: st.listFields
-                        , buf = []
+                        { st
+                            | chunks = flushChunk st.buf st.chunks
+                            , listFields =
+                                Naming.fieldName name :: st.listFields
+                            , buf = []
                         }
 
                 else
@@ -577,11 +592,11 @@ chunkGo listNames chars st =
 
         c :: rest ->
             chunkGo listNames rest { st | buf = c :: st.buf }
+
+
 -- ===========================================================================
 -- Param typing
 -- ===========================================================================
-
-
 resolveParams : Catalog -> Prepared -> List ParamOcc -> List String -> List String -> Result Error (List ResolvedParam)
 resolveParams cat prep occs distinct listNames =
     let
@@ -690,10 +705,10 @@ applyForceNull force base =
 
         FNone ->
             base
+
+
 -- Reuse the table Model iff projection == full table in declared order,
 -- all plain columns, no alias, no force.
-
-
 directiveMap : List Directive -> Dict String TypeSpec
 directiveMap dirs =
     Dict.fromList (List.filterMap paramPair dirs)
@@ -713,9 +728,9 @@ paramPair d =
 idTypeSpec : TypeSpec -> TypeSpec
 idTypeSpec s =
     s
+
+
 -- Table the statement targets (for adjacency lookups)
-
-
 stmtTable : ParsedStmt -> String
 stmtTable parsed =
     case parsed of
@@ -759,9 +774,9 @@ insertTable i =
 createName : CreateTable -> String
 createName c =
     c.name
+
+
 -- INSERT: positional param -> column mapping
-
-
 insertParamTyping : Catalog -> InsertStmt -> List String -> Result Error (Dict String ParamInfo)
 insertParamTyping cat ins distinct =
     case Catalog.lookup ins.table cat of
@@ -937,10 +952,11 @@ adjStepU scope t st =
                 case st.prevWord of
 
                     Just q ->
-                        { st | pending = colTypeQual scope (Just q) w
-                        , dotArmed = False
-                        , prevWord = Nothing
-                        , limitNext = False
+                        { st
+                            | pending = colTypeQual scope (Just q) w
+                            , dotArmed = False
+                            , prevWord = Nothing
+                            , limitNext = False
                         }
 
                     Nothing ->
@@ -955,8 +971,6 @@ adjStepU scope t st =
 
             else
                 { st | dotArmed = False, prevWord = Nothing }
--- A bare (unqualified) word: a column sets `pending`; LIMIT/OFFSET arms the
--- next param as Int; otherwise it's tracked as a potential qualifier/alias.
 
         TParam name _ ->
             stepParamU name st
@@ -965,32 +979,37 @@ adjStepU scope t st =
             { st | dotArmed = False, prevWord = Nothing }
 
 
+-- A bare (unqualified) word: a column sets `pending`; LIMIT/OFFSET arms the
+-- next param as Int; otherwise it's tracked as a potential qualifier/alias.
 stepPlainWord : List ScopeEntry -> String -> AdjState2 -> AdjState2
 stepPlainWord scope w st =
     let
         u = String.toUpper w
     in
         if u == "LIMIT" || u == "OFFSET" then
-            { st | limitNext = True
-            , pending = Nothing
-            , prevWord = Nothing
-            , dotArmed = False
+            { st
+                | limitNext = True
+                , pending = Nothing
+                , prevWord = Nothing
+                , dotArmed = False
             }
 
         else
             case colTypeQual scope Nothing w of
 
                 Just ty ->
-                    { st | pending = Just ty
-                    , limitNext = False
-                    , prevWord = Just w
-                    , dotArmed = False
+                    { st
+                        | pending = Just ty
+                        , limitNext = False
+                        , prevWord = Just w
+                        , dotArmed = False
                     }
 
                 Nothing ->
-                    { st | limitNext = False
-                    , prevWord = Just w
-                    , dotArmed = False
+                    { st
+                        | limitNext = False
+                        , prevWord = Just w
+                        , dotArmed = False
                     }
 
 
@@ -1022,10 +1041,11 @@ stepParamU name st =
                 Nothing ->
                     st.result
     in
-        { st | result = newResult
-        , limitNext = False
-        , prevWord = Nothing
-        , dotArmed = False
+        { st
+            | result = newResult
+            , limitNext = False
+            , prevWord = Nothing
+            , dotArmed = False
         }
 
 
@@ -1071,10 +1091,10 @@ resolveResult cat prep =
                                 prep
                                 (stmtTable prep.parsed)
                                 ret
+
+
 -- The RETURNING projection of a statement (empty for SELECT / CREATE and for
 -- DML without a RETURNING clause).
-
-
 stmtReturning : ParsedStmt -> List SelectItem
 stmtReturning parsed =
     case parsed of
@@ -1105,9 +1125,9 @@ updateReturning u =
 deleteReturning : DeleteStmt -> List SelectItem
 deleteReturning d =
     d.returning
+
+
 -- :exec / :execrows discard rows, so a RETURNING clause is a contradiction.
-
-
 noResultOrReturningErr : String -> List SelectItem -> Result Error ResultShape
 noResultOrReturningErr cardStr ret =
     if List.isEmpty ret then
@@ -1130,10 +1150,10 @@ resolveSelectResult cat prep sel =
                        scope
                        sel.items
                        (not (List.isEmpty sel.joins)))
+
+
 -- RETURNING result: resolve the projection against a single-table scope for
 -- the DML target. No outer-join demotion (no joins on a RETURNING clause).
-
-
 resolveReturningResult : Catalog -> Prepared -> String -> List SelectItem -> Result Error ResultShape
 resolveReturningResult cat prep table items =
     resolveTableEntry cat table Nothing
@@ -1141,18 +1161,19 @@ resolveReturningResult cat prep table items =
                (\rawE ->
                    let
                        scope =
-                           [{ aliasKey = rawE.aliasKey
-                           , nameKey = rawE.nameKey
-                           , table = rawE.table
-                           , demoted = False
-                           , suppressedCols = []
-                           }]
+                           [ { aliasKey = rawE.aliasKey
+                             , nameKey = rawE.nameKey
+                             , table = rawE.table
+                             , demoted = False
+                             , suppressedCols = []
+                             }
+                           ]
                    in
                        resolveProjection prep scope items False)
+
+
 -- Shared projection -> ResultShape: resolve columns, check collisions, pick
 -- shape (used by SELECT and by RETURNING).
-
-
 resolveProjection : Prepared -> List ScopeEntry -> List SelectItem -> Bool -> Result Error ResultShape
 resolveProjection prep scope items hasJoins =
     let
@@ -1171,10 +1192,10 @@ resolveProjection prep scope items hasJoins =
                                           hasJoins
                                           scope
                                           cols))
+
+
 -- Card-aware shape selection. :scalar/:scalarmany unwrap a single projected
 -- column to a bare value; everything else routes through shapeFor.
-
-
 shapeForCard : Prepared -> List SelectItem -> Bool -> List ScopeEntry -> List ResolvedColumn -> Result Error ResultShape
 shapeForCard prep items hasJoins scope cols =
     case prep.anno.card of
@@ -1202,10 +1223,10 @@ scalarShape cols =
                     ("`:scalar`/`:scalarmany` requires exactly one result column (got "
                         ++ String.fromInt (List.length cols)
                         ++ ")"))
+
+
 -- A JOIN result always emits a Row. A single-table full-projection reuses
 -- the table Model.
-
-
 shapeFor : Prepared -> List SelectItem -> Bool -> List ScopeEntry -> List ResolvedColumn -> ResultShape
 shapeFor prep items hasJoins scope cols =
     case scope of
@@ -1229,10 +1250,10 @@ rowShape prep cols =
         rowDecoder = Naming.fnName prep.anno.name ++ "RowDecoder"
     in
         RowType rowType rowDecoder cols
+
+
 -- Two projected columns with the same output field name clobber the result
 -- dict; require an `AS` alias.
-
-
 checkColumnCollisions : List ResolvedColumn -> List String -> Result Error ()
 checkColumnCollisions cols seen =
     case cols of
@@ -1313,18 +1334,19 @@ buildScope cat sel =
                                               , nameKey = r.nameKey
                                               , table = r.table
                                               , demoted = isDemoted analysis i
-                                              , suppressedCols = suppressedAt sel.joins i
+                                              , suppressedCols =
+                                                  suppressedAt sel.joins i
                                               })
+                                          raws))
+
+
 -- Recursively resolve the subquery's output columns (reusing the SELECT
 -- projection + nullability inference), then convert them to catalog columns.
-                                          raws))
 -- The FROM entry: a catalog table or a derived-table subquery synthesised into
 -- a virtual CatTable (empty modelName marks it synthetic -> never reuses a Model).
 -- Re-parse a derived table's captured inner tokens into a SELECT. Destructured
 -- in two steps + an annotated helper to avoid the constructor-pattern HM gap
 -- (§4.4) on a nested `Ok (PSelect sub)`.
-
-
 parseSubSelect : List Token -> Result Error SelectStmt
 parseSubSelect tokens =
     case Parser.parseStatement tokens of
@@ -1371,11 +1393,12 @@ deriveEntry cat sub aliasStr =
                (\cols ->
                    { aliasKey = Just (String.toLower aliasStr)
                    , nameKey = String.toLower aliasStr
-                   , table = { name = aliasStr
-                     , modelName = ""
-                     , decoderName = ""
-                     , columns = cols
-                     }
+                   , table =
+                       { name = aliasStr
+                       , modelName = ""
+                       , decoderName = ""
+                       , columns = cols
+                       }
                    })
 
 
@@ -1416,11 +1439,11 @@ buildParamScope cat sel outerScope =
                            |> Result.map
                                   (\innerScope ->
                                       List.append outerScope innerScope))
+
+
 -- The k-th join's table (entry index k+1) suppresses its USING columns in
 -- `*` expansion and bare-column resolution: the shared column is provided once
 -- by the left side. The FROM entry (index 0) suppresses nothing.
-
-
 suppressedAt : List Join -> Int -> List String
 suppressedAt joins i =
     if i == 0 then
@@ -1517,7 +1540,9 @@ analyzeGo joins k st =
                 rightIdx = k + 1
                 st2 =
                     if j.kind == JLeft || j.kind == JFull then
-                        { st | rightIdxs = String.fromInt rightIdx :: st.rightIdxs
+                        { st
+                            | rightIdxs =
+                                String.fromInt rightIdx :: st.rightIdxs
                         }
 
                     else
@@ -1536,11 +1561,11 @@ isDemoted : JoinAnalysis -> Int -> Bool
 isDemoted analysis i =
     (analysis.hasLeftDemote && i <= analysis.maxLeftIdx)
         || List.member (String.fromInt i) analysis.rightIdxs
+
+
 -- ===========================================================================
 -- Scope column resolution
 -- ===========================================================================
-
-
 resolveScopeColumns : List ScopeEntry -> List SelectItem -> List String -> List String -> List ResolvedColumn -> Result Error (List ResolvedColumn)
 resolveScopeColumns scope items nullableOv notnullOv acc =
     case items of
@@ -1593,21 +1618,25 @@ resolveScopeItem scope item nullableOv notnullOv =
                                        force
                                        (m.col.nullable || m.entry.demoted)
                            in
-                               [{ field = Naming.fieldName outName
-                               , column = outName
-                               , skyType = m.col.skyType
-                               , nullable = applyOverrides
-                                     outName
-                                     baseNull
-                                     nullableOv
-                                     notnullOv
-                               }])
+                               [ { field = Naming.fieldName outName
+                                 , column = outName
+                                 , skyType = m.col.skyType
+                                 , nullable =
+                                     applyOverrides
+                                         outName
+                                         baseNull
+                                         nullableOv
+                                         notnullOv
+                                 }
+                               ])
 
         SiAgg aggFn arg aliasName force ->
             inferAgg scope aggFn arg aliasName force nullableOv notnullOv
 
         SiCoalesce inner _ aliasName force ->
             inferCoalesce scope inner aliasName force nullableOv notnullOv
+
+
 -- ---------------------------------------------------------------------------
 -- Aggregate / COALESCE nullability + base-type inference (DESIGN §4.5.3-5)
 --   COUNT(*|col)        -> Int,   non-null (always a row; 0 over empty)
@@ -1618,74 +1647,77 @@ resolveScopeItem scope item nullableOv notnullOv =
 --   COALESCE(inner,lit) -> base of inner, non-null (literal guarantees a value)
 -- Per-column AS "c!"/"c?" force + @notnull/@nullable overrides still win.
 -- ---------------------------------------------------------------------------
-
-
 inferAgg : List ScopeEntry -> AggFunc -> AggArg -> String -> Force -> List String -> List String -> Result Error (List ResolvedColumn)
 inferAgg scope aggFn arg aliasName force nullableOv notnullOv =
     case aggFn of
 
         AggCount ->
-            Ok [mkAggCol aliasName TInt False force nullableOv notnullOv]
+            Ok [ mkAggCol aliasName TInt False force nullableOv notnullOv ]
 
         AggAvg ->
             aggArgNumeric scope aggFn arg
                 |> Result.map
                        (\_ ->
-                           [mkAggCol
-                               aliasName
-                               TFloat
-                               True
-                               force
-                               nullableOv
-                               notnullOv])
+                           [ mkAggCol
+                                 aliasName
+                                 TFloat
+                                 True
+                                 force
+                                 nullableOv
+                                 notnullOv
+                           ])
 
         AggSum ->
             aggArgNumeric scope aggFn arg
                 |> Result.map
                        (\base ->
-                           [mkAggCol
-                               aliasName
-                               base
-                               True
-                               force
-                               nullableOv
-                               notnullOv])
+                           [ mkAggCol
+                                 aliasName
+                                 base
+                                 True
+                                 force
+                                 nullableOv
+                                 notnullOv
+                           ])
 
         AggTotal ->
             aggArgNumeric scope aggFn arg
                 |> Result.map
                        (\_ ->
-                           [mkAggCol
-                               aliasName
-                               TFloat
-                               False
-                               force
-                               nullableOv
-                               notnullOv])
+                           [ mkAggCol
+                                 aliasName
+                                 TFloat
+                                 False
+                                 force
+                                 nullableOv
+                                 notnullOv
+                           ])
 
         AggMin ->
             aggArgOrderable scope aggFn arg
                 |> Result.map
                        (\base ->
-                           [mkAggCol
-                               aliasName
-                               base
-                               True
-                               force
-                               nullableOv
-                               notnullOv])
+                           [ mkAggCol
+                                 aliasName
+                                 base
+                                 True
+                                 force
+                                 nullableOv
+                                 notnullOv
+                           ])
 
         AggMax ->
             aggArgOrderable scope aggFn arg
                 |> Result.map
                        (\base ->
-                           [mkAggCol
-                               aliasName
-                               base
-                               True
-                               force
-                               nullableOv
-                               notnullOv])
+                           [ mkAggCol
+                                 aliasName
+                                 base
+                                 True
+                                 force
+                                 nullableOv
+                                 notnullOv
+                           ])
 
 
 inferCoalesce : List ScopeEntry -> CoalesceInner -> String -> Force -> List String -> List String -> Result Error (List ResolvedColumn)
@@ -1693,7 +1725,7 @@ inferCoalesce scope inner aliasName force nullableOv notnullOv =
     coalesceInnerType scope inner
         |> Result.map
                (\base ->
-                   [mkAggCol aliasName base False force nullableOv notnullOv])
+                   [ mkAggCol aliasName base False force nullableOv notnullOv ])
 
 
 coalesceInnerType : List ScopeEntry -> CoalesceInner -> Result Error SkyType
@@ -1791,11 +1823,12 @@ expandTable e nullableOv notnullOv =
             { field = Naming.fieldName c.name
             , column = c.name
             , skyType = c.skyType
-            , nullable = applyOverrides
-                  c.name
-                  (c.nullable || e.demoted)
-                  nullableOv
-                  notnullOv
+            , nullable =
+                applyOverrides
+                    c.name
+                    (c.nullable || e.demoted)
+                    nullableOv
+                    notnullOv
             })
         (List.filter
             (\c -> not (List.member (String.toLower c.name) e.suppressedCols))
@@ -1875,11 +1908,11 @@ matchesAcrossScope scope col acc =
 
         e :: rest ->
             if List.member (String.toLower col) e.suppressedCols then
-                -- a USING-suppressed column is provided by the left side; don't
-                -- count this entry (so a bare USING column isn't "ambiguous")
                 matchesAcrossScope rest col acc
 
             else
+                -- a USING-suppressed column is provided by the left side; don't
+                -- count this entry (so a bare USING column isn't "ambiguous")
                 case findCol col e.table of
 
                     Just c ->
@@ -1968,9 +2001,11 @@ rewriteGo dialect chars st =
                 rewriteGo
                     dialect
                     rem2
-                    { st2 | out = List.append
-                          (List.reverse (String.toList placeholder))
-                          st2.out
+                    { st2
+                        | out =
+                            List.append
+                                (List.reverse (String.toList placeholder))
+                                st2.out
                     }
 
         c :: rest ->
@@ -2031,7 +2066,8 @@ placeholderFor dialect name st =
                         n = st.counter + 1
                     in
                         ( "$" ++ String.fromInt n
-                        , { st | counter = n
-                          , seen = Dict.insert name n st.seen
+                        , { st
+                              | counter = n
+                              , seen = Dict.insert name n st.seen
                           }
                         )

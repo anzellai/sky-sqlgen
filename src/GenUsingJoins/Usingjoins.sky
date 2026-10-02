@@ -9,7 +9,6 @@ import Std.Db as Db
 import Std.Db.Decode as DbDecode
 
 -- EmployeesWithOrg :many
--- EmployeeOrgNames :many
 type alias EmployeesWithOrgRow =
     { orgId : Int
     , empId : Int
@@ -39,7 +38,7 @@ employeesWithOrg : Db -> Task Error (List EmployeesWithOrgRow)
 employeesWithOrg db =
     Db.queryDecode db employeesWithOrgSql [] employeesWithOrgRowDecoder
 
--- EmployeesLeftOrg :many
+-- EmployeeOrgNames :many
 type alias EmployeeOrgNamesRow =
     { orgId : Int
     , name : String
@@ -67,6 +66,7 @@ employeeOrgNames : Db -> Task Error (List EmployeeOrgNamesRow)
 employeeOrgNames db =
     Db.queryDecode db employeeOrgNamesSql [] employeeOrgNamesRowDecoder
 
+-- EmployeesLeftOrg :many
 type alias EmployeesLeftOrgRow =
     { orgId : Int
     , empId : Int

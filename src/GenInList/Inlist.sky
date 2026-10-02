@@ -13,8 +13,8 @@ import Std.Db.Decode as DbDecode
 placeholders : Int -> String
 placeholders n =
     String.join ", " (List.map (\_ -> "?") (List.range 1 n))
--- WidgetsByIds :many
 
+-- WidgetsByIds :many
 type alias WidgetsByIdsRow =
     { id : Int
     , name : String
@@ -40,11 +40,11 @@ WHERE id IN ("""
                 ++ placeholders (List.length params.ids)
                 ++ """)
 ORDER BY id"""
-        args = List.concat [List.map (\x -> Db.SqlInt x) params.ids]
+        args = List.concat [ List.map (\x -> Db.SqlInt x) params.ids ]
     in
         Db.queryDecode db sql args widgetsByIdsRowDecoder
--- ActiveWidgetsByIds :many
 
+-- ActiveWidgetsByIds :many
 type alias ActiveWidgetsByIdsRow =
     { id : Int
     , name : String
@@ -76,13 +76,13 @@ WHERE active = ?
 ORDER BY id"""
         args =
             List.concat
-                [ [Db.SqlBool params.active]
+                [ [ Db.SqlBool params.active ]
                 , List.map (\x -> Db.SqlInt x) params.ids
                 ]
     in
         Db.queryDecode db sql args activeWidgetsByIdsRowDecoder
--- WidgetNamesByIds :scalarmany
 
+-- WidgetNamesByIds :scalarmany
 type alias WidgetNamesByIdsParams =
     { ids : List Int
     , lim : Int
@@ -103,7 +103,7 @@ LIMIT ?"""
         args =
             List.concat
                 [ List.map (\x -> Db.SqlInt x) params.ids
-                , [Db.SqlInt params.lim]
+                , [ Db.SqlInt params.lim ]
                 ]
     in
         Db.queryDecode db sql args (DbDecode.string "name")

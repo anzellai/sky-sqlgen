@@ -25,12 +25,12 @@ productName db params =
     Db.queryDecode
         db
         productNameSql
-        [Db.SqlInt params.id]
+        [ Db.SqlInt params.id ]
         (DbDecode.string "name")
         |> Task.map List.head
+
+
 -- AllNames :scalarmany
-
-
 allNamesSql : String
 allNamesSql =
     """SELECT name
@@ -41,9 +41,9 @@ ORDER BY id"""
 allNames : Db -> Task Error (List String)
 allNames db =
     Db.queryDecode db allNamesSql [] (DbDecode.string "name")
+
+
 -- ProductCount :scalar
-
-
 productCountSql : String
 productCountSql =
     """SELECT count(*) AS n
@@ -54,9 +54,9 @@ productCount : Db -> Task Error (Maybe Int)
 productCount db =
     Db.queryDecode db productCountSql [] (DbDecode.int "n")
         |> Task.map List.head
+
+
 -- MaxPrice :scalar
-
-
 maxPriceSql : String
 maxPriceSql =
     """SELECT max(price) AS hi

@@ -10,7 +10,6 @@ import Std.Db.Decode as DbDecode
 import GenOmit.Schema exposing (Item, itemDecoder)
 
 -- CreateItem :execrows
--- CreateItemReturning :one
 type alias CreateItemParams =
     { name : String
     , status : SqlField
@@ -28,7 +27,7 @@ createItem db params =
         , ( "note", params.note )
         ]
 
--- CreateItemId :scalar
+-- CreateItemReturning :one
 type alias CreateItemReturningParams =
     { name : String
     , status : SqlField
@@ -49,6 +48,7 @@ createItemReturning db params =
         itemDecoder
         |> Task.map List.head
 
+-- CreateItemId :scalar
 type alias CreateItemIdParams =
     { name : String
     , status : SqlField

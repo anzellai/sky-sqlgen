@@ -9,7 +9,6 @@ import Std.Db as Db
 import Std.Db.Decode as DbDecode
 
 -- RegionTotals :many
--- BigRegions :many
 type alias RegionTotalsRow =
     { region : String
     , total : Maybe Int
@@ -34,6 +33,7 @@ regionTotals : Db -> Task Error (List RegionTotalsRow)
 regionTotals db =
     Db.queryDecode db regionTotalsSql [] regionTotalsRowDecoder
 
+-- BigRegions :many
 type alias BigRegionsRow =
     { region : String
     , total : Maybe Int
@@ -58,7 +58,11 @@ ORDER BY region"""
 
 bigRegions : Db -> BigRegionsParams -> Task Error (List BigRegionsRow)
 bigRegions db params =
-    Db.queryDecode db bigRegionsSql [Db.SqlInt params.min] bigRegionsRowDecoder
+    Db.queryDecode
+        db
+        bigRegionsSql
+        [ Db.SqlInt params.min ]
+        bigRegionsRowDecoder
 
 
 -- RegionNames :scalarmany

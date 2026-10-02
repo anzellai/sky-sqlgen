@@ -46,5 +46,5 @@ WHERE qty > ?"""
 
 itemStats : Db -> ItemStatsParams -> Task Error (Maybe ItemStatsRow)
 itemStats db params =
-    Db.queryDecode db itemStatsSql [Db.SqlInt params.min] itemStatsRowDecoder
+    Db.queryDecode db itemStatsSql [ Db.SqlInt params.min ] itemStatsRowDecoder
         |> Task.map List.head

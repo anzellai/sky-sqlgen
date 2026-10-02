@@ -66,11 +66,11 @@ parseFlagsGo args flags =
 
         _ :: rest ->
             parseFlagsGo rest flags
+
+
 -- ---------------------------------------------------------------------------
 -- Pipeline orchestration
 -- ---------------------------------------------------------------------------
-
-
 generate : Flags -> Task Error ()
 generate flags =
     Config.load flags.configPath
@@ -125,17 +125,20 @@ writeOutput flags config out =
                     List.foldl
                         (\f _ -> forcePrintln ("would write: " ++ f.path))
                         ()
--- ---------------------------------------------------------------------------
--- --check : drift gate (CI). Regenerate, sky-fmt-normalise each generated
--- source in a temp dir, diff against the committed file. Exit 1 on any drift
--- (stale / missing). Never writes to the real output tree.
--- ---------------------------------------------------------------------------
                         files
             in
                 Task.succeed ()
 
         else
-            File.mkdirAll config.out |> Task.andThen (\_ -> writeAll files)
+            File.mkdirAll config.out
+                |> Task.andThen
+                       (\_ ->
+                           -- ---------------------------------------------------------------------------
+                           -- --check : drift gate (CI). Regenerate, sky-fmt-normalise each generated
+                           -- source in a temp dir, diff against the committed file. Exit 1 on any drift
+                           -- (stale / missing). Never writes to the real output tree.
+                           -- ---------------------------------------------------------------------------
+                           writeAll files)
                 |> Task.andThen
                        (\_ ->
                            if config.verify && not flags.noVerify then
@@ -160,9 +163,9 @@ forcePrintln s =
         _ = println s
     in
         ()
+
+
 -- Per-skip warnings go to stderr (Std.Log.warn); the run still succeeds.
-
-
 printWarnings : List String -> ()
 printWarnings ws =
     List.foldl (\w _ -> forceWarn w) () ws
@@ -210,10 +213,10 @@ checkDrift files =
                (\dir ->
                    checkDriftGo dir files []
                        |> Task.andThen (\_ -> cleanupTemp dir files))
+
+
 -- Remove the per-file temp copies then the temp dir itself (best-effort;
 -- failures are swallowed since the drift verdict has already been reported).
-
-
 cleanupTemp : String -> List SourceFile -> Task Error ()
 cleanupTemp dir files =
     case files of
@@ -327,11 +330,13 @@ verifyAll files =
                        let
                            _ =
                                List.foldl
-                                   (\f _ -> forcePrintln ("verify ok: " ++ f.path))
+                                   (\f _ ->
+                                       forcePrintln ("verify ok: " ++ f.path))
                                    ()
                                    files
-
-                           _ = println "verify: all generated modules pass sky check"
+                           _ =
+                               println
+                                   "verify: all generated modules pass sky check"
                        in
                            Task.succeed ()
 
@@ -339,11 +344,11 @@ verifyAll files =
                        Task.fail
                            (Error.invalidInput
                                ("verify failed (sky check):\n" ++ output)))
+
+
 -- ---------------------------------------------------------------------------
 -- Entry
 -- ---------------------------------------------------------------------------
-
-
 run : Task Error ()
 run =
     System.args ()

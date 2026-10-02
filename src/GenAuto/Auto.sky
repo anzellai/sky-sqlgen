@@ -10,7 +10,6 @@ import Std.Db.Decode as DbDecode
 import GenAuto.Schema exposing (User, userDecoder)
 
 -- GetUserById :one
--- GetUserById1 :one
 type alias GetUserByIdParams =
     { id : Int }
 
@@ -22,10 +21,10 @@ getUserByIdSql =
 
 getUserById : Db -> GetUserByIdParams -> Task Error (Maybe User)
 getUserById db params =
-    Db.queryDecode db getUserByIdSql [Db.SqlInt params.id] userDecoder
+    Db.queryDecode db getUserByIdSql [ Db.SqlInt params.id ] userDecoder
         |> Task.map List.head
 
--- GetUserByEmail :one
+-- GetUserById1 :one
 type alias GetUserById1Row =
     { id : Int
     , name : String
@@ -37,7 +36,6 @@ getUserById1RowDecoder =
     DbDecode.succeed GetUserById1Row |> DbDecode.andMap (DbDecode.int "id")
         |> DbDecode.andMap (DbDecode.string "name")
 
--- ListUsersByActive :many
 type alias GetUserById1Params =
     { id : Int }
 
@@ -52,11 +50,11 @@ getUserById1 db params =
     Db.queryDecode
         db
         getUserById1Sql
-        [Db.SqlInt params.id]
+        [ Db.SqlInt params.id ]
         getUserById1RowDecoder
         |> Task.map List.head
 
--- CreateUser :execrows
+-- GetUserByEmail :one
 type alias GetUserByEmailParams =
     { email : String }
 
@@ -68,10 +66,14 @@ getUserByEmailSql =
 
 getUserByEmail : Db -> GetUserByEmailParams -> Task Error (Maybe User)
 getUserByEmail db params =
-    Db.queryDecode db getUserByEmailSql [Db.SqlString params.email] userDecoder
+    Db.queryDecode
+        db
+        getUserByEmailSql
+        [ Db.SqlString params.email ]
+        userDecoder
         |> Task.map List.head
 
--- UpdateUserById :execrows
+-- ListUsersByActive :many
 type alias ListUsersByActiveRow =
     { id : Int
     , name : String
@@ -85,7 +87,6 @@ listUsersByActiveRowDecoder =
         |> DbDecode.andMap (DbDecode.string "name")
         |> DbDecode.andMap (DbDecode.string "email")
 
--- DeleteUserById :execrows
 type alias ListUsersByActiveParams =
     { active : Bool }
 
@@ -100,7 +101,7 @@ listUsersByActive db params =
     Db.queryDecode
         db
         listUsersByActiveSql
-        [Db.SqlBool params.active]
+        [ Db.SqlBool params.active ]
         listUsersByActiveRowDecoder
 
 
@@ -114,6 +115,7 @@ listUsers : Db -> Task Error (List User)
 listUsers db =
     Db.queryDecode db listUsersSql [] userDecoder
 
+-- CreateUser :execrows
 type alias CreateUserParams =
     { name : String
     , email : String
@@ -139,6 +141,7 @@ createUser db params =
         , Db.SqlString params.createdAt
         ]
 
+-- UpdateUserById :execrows
 type alias UpdateUserByIdParams =
     { name : String
     , email : String
@@ -161,6 +164,7 @@ updateUserById db params =
         , Db.SqlInt params.id
         ]
 
+-- DeleteUserById :execrows
 type alias DeleteUserByIdParams =
     { id : Int }
 
@@ -172,4 +176,4 @@ deleteUserByIdSql =
 
 deleteUserById : Db -> DeleteUserByIdParams -> Task Error Int
 deleteUserById db params =
-    Db.exec db deleteUserByIdSql [Db.SqlInt params.id]
+    Db.exec db deleteUserByIdSql [ Db.SqlInt params.id ]
