@@ -315,29 +315,30 @@ fmtFile path =
 
 verifyAll : List SourceFile -> Task Error ()
 verifyAll files =
-    case files of
+    -- `sky check <path>` takes <path> as the program entry, and a generated
+    -- module has no `main`, so Sky refuses it ("lowering found no entry
+    -- `main`"). Check the project once instead: `sky check` type-checks every
+    -- module under the source root, the generated ones included, and builds
+    -- the project's entry (a library project builds every module).
+    Process.run "sky" [ "check" ]
+        |> Task.andThen
+               (\output ->
+                   if String.contains "No errors found" output then
+                       let
+                           _ =
+                               List.foldl
+                                   (\f _ -> forcePrintln ("verify ok: " ++ f.path))
+                                   ()
+                                   files
 
-        [] ->
-            let
-                _ = println "verify: all generated modules pass sky check"
-            in
-                Task.succeed ()
+                           _ = println "verify: all generated modules pass sky check"
+                       in
+                           Task.succeed ()
 
-        f :: rest ->
-            Process.run "sky" [ "check", f.path ]
-                |> Task.andThen
-                       (\output ->
-                           if String.contains "No errors found" output then
-                               let
-                                   _ = println ("verify ok: " ++ f.path)
-                               in
-                                   verifyAll rest
-
-                           else
-                               Task.fail
-                                   (Error.invalidInput
-                                       ("verify failed for " ++ f.path ++ ":\n"
-                                           ++ output)))
+                   else
+                       Task.fail
+                           (Error.invalidInput
+                               ("verify failed (sky check):\n" ++ output)))
 -- ---------------------------------------------------------------------------
 -- Entry
 -- ---------------------------------------------------------------------------

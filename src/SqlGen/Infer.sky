@@ -1927,7 +1927,7 @@ plainColNamesGo items acc =
         [] ->
             Just (List.reverse acc)
 
-        (SiCol _ col (Nothing FNone)) :: rest ->
+        (SiCol _ col Nothing FNone) :: rest ->
             plainColNamesGo rest (col :: acc)
 
         _ ->
