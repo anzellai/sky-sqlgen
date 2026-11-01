@@ -19,9 +19,9 @@ wordOf t =
 
         _ ->
             Nothing
+
+
 -- Skip an ON <condition> up to the next join / clause keyword.
-
-
 eqWord : String -> String -> Bool
 eqWord a b =
     String.toUpper a == String.toUpper b
@@ -36,11 +36,11 @@ keywordIs kw t =
 
         _ ->
             False
+
+
 -- ===========================================================================
 -- Top-level dispatch
 -- ===========================================================================
-
-
 isSym : String -> Token -> Bool
 isSym s t =
     case t of
@@ -50,14 +50,12 @@ isSym s t =
 
         _ ->
             False
+
+
 -- ===========================================================================
 -- Paren / comma utilities
 -- ===========================================================================
-
-
 -- Given tokens starting at "(", return (innerTokens, tokensAfterClosingParen).
-
-
 parseStatement : List Token -> Result Error ParsedStmt
 parseStatement tokens =
     case tokens of
@@ -110,14 +108,14 @@ isDdl tokens =
 
                 Nothing ->
                     False
--- A single (possibly qualified) column reference.  Uses variable-bind list
--- steps; the nested-cons lowering bug that originally motivated this
--- (IMPL-PUSHBACK §7.6) was fixed upstream in #583 — style kept for clarity.
 
         [] ->
             False
 
 
+-- A single (possibly qualified) column reference.  Uses variable-bind list
+-- steps; the nested-cons lowering bug that originally motivated this
+-- (IMPL-PUSHBACK §7.6) was fixed upstream in #583 — style kept for clarity.
 betweenParens : List Token -> Result Error ( List Token, List Token )
 betweenParens tokens =
     case tokens of
@@ -153,9 +151,9 @@ grabParen tokens depth acc =
 
             else
                 grabParen rest depth (t :: acc)
+
+
 -- Split a token list on top-level commas (paren depth 0).
-
-
 splitCommas : List Token -> List (List Token)
 splitCommas tokens =
     splitCommasGo tokens 0 [] []
@@ -189,9 +187,9 @@ pushCur cur acc =
 
     else
         List.reverse cur :: acc
+
+
 -- take tokens up to (exclusive) the first top-level token matching pred
-
-
 takeUntil : (Token -> Bool) -> List Token -> ( List Token, List Token )
 takeUntil pred tokens =
     takeUntilGo pred tokens 0 []
@@ -216,11 +214,11 @@ takeUntilGo pred tokens depth acc =
 
             else
                 takeUntilGo pred rest depth (t :: acc)
+
+
 -- ===========================================================================
 -- CREATE TABLE
 -- ===========================================================================
-
-
 parseCreate : List Token -> Result Error ParsedStmt
 parseCreate tokens =
     -- drop CREATE TABLE [IF NOT EXISTS]
@@ -312,10 +310,10 @@ type alias ColumnSections =
     , pkCols : List String
     , uniqueCols : List String
     }
+
+
 -- Annotated accessors (constructor-pattern-bound records need a typed helper
 -- for field access, see IMPL-PUSHBACK §4).
-
-
 parseColumnSections : List (List Token) -> List ParsedColumn -> List String -> List String -> Result Error ColumnSections
 parseColumnSections sections cols pks uniques =
     case sections of
@@ -356,10 +354,9 @@ isTableConstraint section =
                     let
                         u = String.toUpper w
                     in
-                        u == "PRIMARY" || u == "FOREIGN" || u == "UNIQUE" || u
-                            == "CHECK"
-                            || u
-                            == "CONSTRAINT"
+                        u == "PRIMARY" || u == "FOREIGN" || u == "UNIQUE"
+                            || u == "CHECK"
+                            || u == "CONSTRAINT"
 
                 Nothing ->
                     False
@@ -381,10 +378,10 @@ extractPkCols section =
 
                     Err _ ->
                         []
--- A table-level `UNIQUE ( col, ... )` constraint yields its column list.
--- `CONSTRAINT name UNIQUE (...)` and composite uniques are tolerated (best
--- effort — a composite UNIQUE still flags each member column as unique).
 
+            -- A table-level `UNIQUE ( col, ... )` constraint yields its column list.
+            -- `CONSTRAINT name UNIQUE (...)` and composite uniques are tolerated (best
+            -- effort — a composite UNIQUE still flags each member column as unique).
             else
                 []
 
@@ -452,20 +449,13 @@ isConstraintStarter t =
                 u = String.toUpper w
             in
                 u == "NOT" || u == "NULL" || u == "PRIMARY" || u == "UNIQUE"
-                    || u
-                    == "DEFAULT"
-                    || u
-                    == "REFERENCES"
-                    || u
-                    == "CHECK"
-                    || u
-                    == "AUTOINCREMENT"
-                    || u
-                    == "COLLATE"
-                    || u
-                    == "GENERATED"
-                    || u
-                    == "CONSTRAINT"
+                    || u == "DEFAULT"
+                    || u == "REFERENCES"
+                    || u == "CHECK"
+                    || u == "AUTOINCREMENT"
+                    || u == "COLLATE"
+                    || u == "GENERATED"
+                    || u == "CONSTRAINT"
 
         _ ->
             False
@@ -496,9 +486,6 @@ scanConstraintsGo tokens flags =
 
         [] ->
             flags
--- ===========================================================================
--- SELECT
--- ===========================================================================
 
         a :: b :: rest ->
             if eqTokWord a "NOT" && eqTokWord b "NULL" then
@@ -514,6 +501,9 @@ scanConstraintsGo tokens flags =
             scanConstraintsGo rest (applyFlag a flags)
 
 
+-- ===========================================================================
+-- SELECT
+-- ===========================================================================
 applyFlag : Token -> ColFlags -> ColFlags
 applyFlag t flags =
     case t of
@@ -561,11 +551,16 @@ parseSelect tokens =
                                                               |> Result.map
                                                                      (\items ->
                                                                          PSelect
-                                                                             { items = items
-                                                                             , fromTable = fromRef.table
-                                                                             , fromAlias = fromRef.aliasName
-                                                                             , joins = joins
-                                                                             , fromSubTokens = fromRef.fromSubTokens
+                                                                             { items =
+                                                                                 items
+                                                                             , fromTable =
+                                                                                 fromRef.table
+                                                                             , fromAlias =
+                                                                                 fromRef.aliasName
+                                                                             , joins =
+                                                                                 joins
+                                                                             , fromSubTokens =
+                                                                                 fromRef.fromSubTokens
                                                                              })))
 
                         else
@@ -609,10 +604,10 @@ parseFromSource tokens =
 
         [] ->
             Err (Error.invalidInput "expected a FROM source")
+
+
 -- `( SELECT ... ) [AS] alias` — the alias is mandatory for a derived table.
 -- The inner tokens are captured raw and validated/resolved in Infer.
-
-
 parseDerived : List Token -> Result Error FromSource
 parseDerived tokens =
     betweenParens tokens
@@ -672,10 +667,10 @@ parseTableRef tokens =
 
         [] ->
             Err (Error.invalidInput "expected table name after FROM/JOIN")
+
+
 -- Optional `[AS] alias` after a table name. A bare word that is a clause /
 -- join keyword is NOT an alias.
-
-
 parseOptAlias : List Token -> ( Maybe String, List Token )
 parseOptAlias tokens =
     case tokens of
@@ -781,9 +776,9 @@ joinHeadKind jh =
 joinHeadRest : JoinHead -> List Token
 joinHeadRest jh =
     jh.rest
+
+
 -- Recognise an optional leading join clause and its kind.
-
-
 detectJoinKind : List Token -> Maybe JoinHead
 detectJoinKind tokens =
     case tokens of
@@ -812,15 +807,15 @@ detectJoinKind tokens =
 
                 else
                     Nothing
--- `*` only valid for count.
 
         [] ->
             Nothing
+
+
+-- `*` only valid for count.
 -- ===========================================================================
 -- DELETE
 -- ===========================================================================
-
-
 skipOuterThenJoin : List Token -> JoinKind -> Maybe JoinHead
 skipOuterThenJoin tokens kind =
     case tokens of
@@ -964,7 +959,7 @@ parseSelectItem section =
     in
         case core of
 
-            [t] ->
+            [ t ] ->
                 if isSym "*" t then
                     Ok (SiStar Nothing)
 
@@ -978,7 +973,7 @@ parseSelectItem section =
                             Err
                                 (Error.invalidInput "unsupported projection item")
 
-            [a, dot, b] ->
+            [ a, dot, b ] ->
                 if isSym "." dot && isSym "*" b then
                     case wordOf a of
 
@@ -1007,14 +1002,14 @@ parseSelectItem section =
 
             _ ->
                 parseAggItem core aliasOpt force
+
+
 -- ===========================================================================
 -- Aggregate / expression projection parsing
 --   FUNC ( <arg> )                  FUNC in count/sum/avg/min/max/total
 --   COALESCE ( <inner> , <literal> ) / IFNULL ( <inner> , <literal> )
 -- All require an `AS alias` (loud-fail otherwise).
 -- ===========================================================================
-
-
 parseAggItem : List Token -> Maybe String -> Force -> Result Error SelectItem
 parseAggItem core aliasOpt force =
     case aliasOpt of
@@ -1107,7 +1102,7 @@ isStarArg : List Token -> Bool
 isStarArg toks =
     case toks of
 
-        [t] ->
+        [ t ] ->
             isSym "*" t
 
         _ ->
@@ -1118,7 +1113,7 @@ parseColRef : List Token -> Maybe ( Maybe String, String )
 parseColRef toks =
     case toks of
 
-        [t] ->
+        [ t ] ->
             case wordOf t of
 
                 Just col ->
@@ -1127,7 +1122,7 @@ parseColRef toks =
                 Nothing ->
                     Nothing
 
-        [a, dot, b] ->
+        [ a, dot, b ] ->
             if isSym "." dot then
                 case ( wordOf a, wordOf b ) of
 
@@ -1175,7 +1170,7 @@ parseCoalesce : List Token -> String -> Force -> Result Error SelectItem
 parseCoalesce inner aliasStr force =
     case splitCommas inner of
 
-        [innerExpr, fallbackExpr] ->
+        [ innerExpr, fallbackExpr ] ->
             parseCoalesceInner innerExpr
                 |> Result.andThen
                        (\ci ->
@@ -1269,7 +1264,7 @@ parseLiteralKind : List Token -> Result Error LitKind
 parseLiteralKind toks =
     case toks of
 
-        [t] ->
+        [ t ] ->
             case t of
 
                 TNum n ->
@@ -1291,9 +1286,9 @@ parseLiteralKind toks =
             Err
                 (Error.invalidInput
                     "coalesce/ifnull fallback must be a single literal value")
+
+
 -- split trailing  AS <alias>  (alias may be a quoted ident with !/? suffix)
-
-
 splitAlias : List Token -> AliasParse
 splitAlias section =
     case findAs section [] of
@@ -1342,13 +1337,13 @@ stripForce s =
 
     else
         ( s, FNone )
+
+
 -- ===========================================================================
 -- RETURNING (optional trailing clause on INSERT / UPDATE / DELETE)
 -- ===========================================================================
 -- Scan for a top-level RETURNING keyword and parse the projection that
 -- follows (the same projection grammar as SELECT). Absent -> Ok [].
-
-
 parseReturning : List Token -> Result Error (List SelectItem)
 parseReturning tokens =
     case dropUntilReturning tokens of
@@ -1377,11 +1372,11 @@ dropUntilReturning tokens =
 
             else
                 dropUntilReturning rest
+
+
 -- ===========================================================================
 -- INSERT
 -- ===========================================================================
-
-
 parseInsert : List Token -> Result Error ParsedStmt
 parseInsert tokens =
     case tokens of
@@ -1399,7 +1394,10 @@ parseInsert tokens =
                                            (\ret ->
                                                PInsert
                                                    { table = table
-                                                   , columns = List.filterMap wordOf inner
+                                                   , columns =
+                                                       List.filterMap
+                                                           wordOf
+                                                           inner
                                                    , returning = ret
                                                    })
 
@@ -1418,11 +1416,11 @@ parseInsert tokens =
 
         _ ->
             Err (Error.invalidInput "truncated INSERT statement")
+
+
 -- ===========================================================================
 -- UPDATE
 -- ===========================================================================
-
-
 parseUpdate : List Token -> Result Error ParsedStmt
 parseUpdate tokens =
     case tokens of
@@ -1473,9 +1471,9 @@ parseUpdate tokens =
 
         _ ->
             Err (Error.invalidInput "truncated UPDATE statement")
+
+
 -- "col = @x" -> Just "col"
-
-
 assignmentCol : List Token -> Maybe String
 assignmentCol section =
     case section of

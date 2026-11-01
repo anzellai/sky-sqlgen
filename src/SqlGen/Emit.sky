@@ -16,14 +16,14 @@ header =
 nl2 : String
 nl2 =
     "\n\n"
+
+
 -- ===========================================================================
 -- Decimal support: import + the composed column decoder helper
 -- ===========================================================================
 -- Emitted once per module that decodes any Decimal column. There is no
 -- built-in DbDecode.decimal, so a Decimal column is read as TEXT and parsed
 -- losslessly via Std.Decimal.fromString.
-
-
 decimalImportLine : String
 decimalImportLine =
     "import Std.Decimal as Decimal\n"
@@ -53,17 +53,17 @@ isDecimalType t =
 anyDecimal : List SkyType -> Bool
 anyDecimal types =
     List.any isDecimalType types
+
+
 -- ===========================================================================
 -- Schema module
 -- ===========================================================================
-
-
 emitSchema : String -> Catalog -> String
 emitSchema modulePrefix cat =
     let
         tables = List.filterMap (\k -> Dict.get k cat.tables) cat.order
--- The bare primitive (or decimalCol / money / nullable) decoder for a scalar
--- result's single column.
+        -- The bare primitive (or decimalCol / money / nullable) decoder for a scalar
+        -- result's single column.
         needsDecimal =
             anyDecimal
                 (List.concatMap
@@ -89,10 +89,10 @@ emitSchema modulePrefix cat =
         bodies = List.map emitTable tables
     in
         head ++ helperBlock ++ String.concat bodies ++ "\n"
+
+
 -- Shared runtime helper: build N comma-joined `?` placeholders for IN-list
 -- expansion. Emitted once per module that has any list param.
-
-
 emitTable : CatTable -> String
 emitTable table =
     nl2 ++ emitModelAlias table ++ nl2 ++ emitModelDecoder table
@@ -121,11 +121,11 @@ emitModelDecoder table =
                (List.map
                    (\c -> decoderLine c.name c.skyType c.nullable)
                    table.columns)
+
+
 -- ===========================================================================
 -- Query module
 -- ===========================================================================
-
-
 emitQueryModule : String -> String -> List ResolvedStatement -> String
 emitQueryModule modulePrefix fileModule stmts =
     let
@@ -206,11 +206,11 @@ collectModelImports stmts =
                             [])
                 stmts))
         []
+
+
 -- Column types decoded *inline* in this module (RowType only). ReuseModel
 -- statements decode via the Schema module's decoder, so their Decimal columns
 -- are handled by the Schema-module helper, not this one.
-
-
 collectRowTypes : List ResolvedStatement -> List SkyType
 collectRowTypes stmts =
     List.concatMap
@@ -221,7 +221,7 @@ collectRowTypes stmts =
                     List.map (\c -> c.skyType) cols
 
                 ScalarType c ->
-                    [c.skyType]
+                    [ c.skyType ]
 
                 _ ->
                     [])
@@ -307,9 +307,9 @@ emitParamsAlias s =
     "type alias " ++ s.baseName ++ "Params =\n"
         ++ emitRecordFields
                (List.map (\p -> ( p.field, paramTypeRef p )) s.params)
+
+
 -- A list param renders `List <base>`; a scalar param uses the usual Maybe/bare.
-
-
 paramTypeRef : ResolvedParam -> String
 paramTypeRef p =
     if p.isOmit then
@@ -410,10 +410,10 @@ rowName s =
 
         NoResult ->
             "()"
+
+
 -- The element type of a scalar result: parenthesised when the column itself is
 -- nullable (e.g. `:scalarmany` of a nullable column -> `List (Maybe String)`).
-
-
 scalarElem : ResolvedStatement -> String
 scalarElem s =
     case s.result of
@@ -525,12 +525,12 @@ argExpr field typeMap =
 
         Nothing ->
             "params." ++ field
+
+
 -- ===========================================================================
 -- IN (@list) runtime SQL + args emission
 -- ===========================================================================
 -- sql expression: chunk0 ++ placeholders (List.length params.f0) ++ chunk1 ++ …
-
-
 emitListSqlExpr : List String -> List String -> String
 emitListSqlExpr chunks listFields =
     let
@@ -550,9 +550,9 @@ quoteChunk c =
 
     else
         "\"\"\"" ++ c ++ "\"\"\""
+
+
 -- interleave [c0,c1,c2] [p0,p1] = [c0,p0,c1,p1,c2]
-
-
 interleaveStr : List String -> List String -> List String
 interleaveStr chunks phs =
     case chunks of
@@ -564,14 +564,14 @@ interleaveStr chunks phs =
             case phs of
 
                 [] ->
-                    [c]
+                    [ c ]
 
                 p :: restPhs ->
                     c :: p :: interleaveStr restChunks restPhs
+
+
 -- args expression: List.concat [ <group>, <group>, … ] in placeholder order;
 -- a scalar group is a singleton list, a list group is List.map over the param.
-
-
 emitListArgs : ResolvedStatement -> String
 emitListArgs s =
     let
@@ -602,6 +602,8 @@ argGroupExpr field typeMap =
 
         Nothing ->
             "[ params." ++ field ++ " ]"
+
+
 -- ===========================================================================
 -- DEFAULT-omittable INSERT (`-- @omit`) emission
 -- ===========================================================================
@@ -610,13 +612,12 @@ argGroupExpr field typeMap =
 -- columns are wrapped in `Db.SetField (...)`. The runtime drops `OmitField`
 -- columns (DB DEFAULT applies) and binds the rest. Column names are schema
 -- LITERALS (no injection surface).
-
-
 -- @omit INSERT: with a RETURNING result -> insertFieldsReturning (decode the
 -- returned rows); otherwise -> insertFields (affected-row count / unit).
 emitOmitCall : ResolvedStatement -> String
 emitOmitCall s =
     case s.result of
+
         NoResult ->
             emitInsertFields s
 
@@ -626,16 +627,20 @@ emitOmitCall s =
 
 omitPairList : ResolvedStatement -> String
 omitPairList s =
-    "[ " ++ String.join "\n        , " (List.map pairElem s.insertCols) ++ "\n        ]"
+    "[ " ++ String.join "\n        , " (List.map pairElem s.insertCols)
+        ++ "\n        ]"
 
 
 emitInsertFields : ResolvedStatement -> String
 emitInsertFields s =
     let
         call =
-            "    Db.insertFields db \"" ++ s.insertTable ++ "\"\n        " ++ omitPairList s ++ "\n"
+            "    Db.insertFields db \"" ++ s.insertTable ++ "\"\n        "
+                ++ omitPairList s
+                ++ "\n"
     in
         case s.card of
+
             CExec ->
                 call ++ "        |> Task.map (\\_ -> ())\n"
 
@@ -647,12 +652,17 @@ emitInsertFieldsReturning : ResolvedStatement -> String
 emitInsertFieldsReturning s =
     let
         call =
-            "    Db.insertFieldsReturning db \"" ++ s.insertTable ++ "\"\n        "
+            "    Db.insertFieldsReturning db \"" ++ s.insertTable
+                ++ "\"\n        "
                 ++ omitPairList s
-                ++ "\n        \"" ++ returningProjection s.result ++ "\"\n        "
-                ++ decoderArg s ++ "\n"
+                ++ "\n        \""
+                ++ returningProjection s.result
+                ++ "\"\n        "
+                ++ decoderArg s
+                ++ "\n"
     in
         case s.card of
+
             COne ->
                 call ++ "        |> Task.map List.head\n"
 
@@ -668,6 +678,7 @@ emitInsertFieldsReturning s =
 returningProjection : ResultShape -> String
 returningProjection r =
     case r of
+
         ReuseModel _ _ ->
             "*"
 
@@ -684,6 +695,7 @@ returningProjection r =
 decoderArg : ResolvedStatement -> String
 decoderArg s =
     case s.card of
+
         CScalar ->
             "(" ++ scalarDecoder s ++ ")"
 
@@ -709,11 +721,11 @@ pairElem ic =
                     sqlValueCtor ic.skyType ++ " params." ++ ic.field
         in
             "( \"" ++ ic.sqlCol ++ "\", Db.SetField (" ++ inner ++ ") )"
+
+
 -- ===========================================================================
 -- Shared field / type rendering
 -- ===========================================================================
-
-
 typeRef : SkyType -> Bool -> String
 typeRef t nullable =
     if nullable then

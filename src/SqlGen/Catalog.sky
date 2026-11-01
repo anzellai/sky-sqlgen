@@ -17,17 +17,17 @@ empty =
 lookup : String -> Catalog -> Maybe CatTable
 lookup name cat =
     Dict.get (String.toLower name) cat.tables
+
+
 -- Tables in declaration order (deterministic; Dict.values order is not).
-
-
 orderedTables : Catalog -> List CatTable
 orderedTables cat =
     List.filterMap (\k -> Dict.get k cat.tables) cat.order
+
+
 -- ---------------------------------------------------------------------------
 -- SQL type spelling -> Sky base type
 -- ---------------------------------------------------------------------------
-
-
 mapSqlType : DecimalMode -> List String -> Result Error SkyType
 mapSqlType decimalMode typeWords =
     case typeWords of
@@ -43,7 +43,7 @@ mapSqlType decimalMode typeWords =
                 if containsAny [ "INT", "SERIAL" ] head then
                     Ok TInt
 
-                else if containsAny ["BOOL"] head then
+                else if containsAny [ "BOOL" ] head then
                     Ok TBool
 
                 else if containsAny
@@ -66,7 +66,7 @@ mapSqlType decimalMode typeWords =
                 else if containsAny [ "BLOB", "BYTEA" ] head then
                     Ok TBytes
 
-                else if containsAny ["MONEY"] head then
+                else if containsAny [ "MONEY" ] head then
                     Ok TMoney
 
                 else if containsAny [ "NUMERIC", "DECIMAL", "DEC" ] head then
@@ -113,11 +113,11 @@ firstWord words =
 containsAny : List String -> String -> Bool
 containsAny needles haystack =
     List.any (\n -> String.contains n haystack) needles
+
+
 -- ---------------------------------------------------------------------------
 -- [[sqlgen.override]] type overrides — validation
 -- ---------------------------------------------------------------------------
-
-
 parseOverrideType : String -> Result Error SkyType
 parseOverrideType s =
     if s == "Int" then
@@ -146,9 +146,9 @@ parseOverrideType s =
             (Error.invalidInput
                 ("unknown sky_type override: '" ++ s
                     ++ "' (expected Int/Float/String/Bool/Bytes/Decimal/Money)"))
+
+
 -- Validate the raw override list into a "table.col" -> SkyType dict.
-
-
 validateOverrides : List ColumnOverride -> Result Error (Dict String SkyType)
 validateOverrides overrides =
     validateOverridesGo overrides Dict.empty
@@ -182,11 +182,11 @@ validateOverridesGo overrides acc =
                                     ++ String.toLower o.column
                         in
                             validateOverridesGo rest (Dict.insert okey t acc)
+
+
 -- ---------------------------------------------------------------------------
 -- Build catalog from parsed CREATE TABLE statements
 -- ---------------------------------------------------------------------------
-
-
 build : CatalogOpts -> List CreateTable -> Result Error Catalog
 build opts creates =
     buildGo opts creates empty
@@ -241,8 +241,9 @@ addTable opts ct cat =
                             }
                     in
                         Ok
-                            { cat | tables = Dict.insert key table cat.tables
-                            , order = List.append cat.order [key]
+                            { cat
+                                | tables = Dict.insert key table cat.tables
+                                , order = List.append cat.order [ key ]
                             }
 
 
@@ -285,10 +286,10 @@ buildColumnsGo opts tableKey pkCols uniqueCols cols acc =
                             uniqueCols
                             rest
                             (catCol :: acc)
+
+
 -- A column's resolved type: a matching [[sqlgen.override]] wins over the
 -- default SQL-type mapping.
-
-
 columnType : CatalogOpts -> String -> ParsedColumn -> Result Error SkyType
 columnType opts tableKey c =
     let

@@ -69,17 +69,23 @@ run config schemaFiles queryFiles =
                                                              queryFiles
                                                              |> Result.map
                                                                     (\mres ->
-                                                                        { schema = { path = schemaOutPath
-                                                                                config
-                                                                          , source = Emit.emitSchema
-                                                                                config.modulePrefix
-                                                                                cat
-                                                                          }
-                                                                        , modules = mres.files
-                                                                        , warnings = List.append
-                                                                              createScan.warnings
-                                                                              mres.warnings
-                                                                        , generated = mres.generated
+                                                                        { schema =
+                                                                            { path =
+                                                                                schemaOutPath
+                                                                                    config
+                                                                            , source =
+                                                                                Emit.emitSchema
+                                                                                    config.modulePrefix
+                                                                                    cat
+                                                                            }
+                                                                        , modules =
+                                                                            mres.files
+                                                                        , warnings =
+                                                                            List.append
+                                                                                createScan.warnings
+                                                                                mres.warnings
+                                                                        , generated =
+                                                                            mres.generated
                                                                         }))))
 
 
@@ -103,11 +109,11 @@ dedupFiles files seen =
 
             else
                 f :: dedupFiles rest (f.path :: seen)
+
+
 -- ---------------------------------------------------------------------------
 -- Phase A: collect CREATE TABLE statements into a catalog
 -- ---------------------------------------------------------------------------
-
-
 collectCreates : List TaggedStmt -> List CreateTable -> List String -> CreateScan
 collectCreates tagged acc warns =
     case tagged of
@@ -126,10 +132,8 @@ collectCreates tagged acc warns =
                             collectCreates rest (ct :: acc) warns
 
                         Ok _ ->
-                        -- ALTER / DROP not modelled in v1; skip silently
+                            -- ALTER / DROP not modelled in v1; skip silently
                             collectCreates rest acc warns
--- A CREATE TABLE that fails to parse is skipped with a warning (its dependent
--- queries then skip too, since they can't type against the missing table).
 
                         Err e ->
                             collectCreates
@@ -139,13 +143,15 @@ collectCreates tagged acc warns =
 
                 else
                     collectCreates rest acc warns
+
+
+-- A CREATE TABLE that fails to parse is skipped with a warning (its dependent
+-- queries then skip too, since they can't type against the missing table).
 -- ---------------------------------------------------------------------------
 -- Phase A2: collect @model renames (query annotation -> target table's Model)
 -- Parse / annotation errors are swallowed here (returned as no-op) so the real
 -- diagnostic surfaces with file:line during DML resolution.
 -- ---------------------------------------------------------------------------
-
-
 collectModelOverrides : List TaggedStmt -> Dict String String -> Result Error (Dict String String)
 collectModelOverrides tagged acc =
     case tagged of
@@ -238,11 +244,11 @@ modelDirective dirs =
                     _ ->
                         Nothing)
             dirs)
+
+
 -- ---------------------------------------------------------------------------
 -- Phase B: per query file, infer + emit a module
 -- ---------------------------------------------------------------------------
-
-
 buildModules : Config -> Catalog -> List FileContent -> Result Error ModulesResult
 buildModules config cat files =
     buildModulesGo config cat files [] [] 0
@@ -319,13 +325,15 @@ buildOneModule config cat f =
                            let
                                moduleName = moduleNameOf f.path
                            in
-                               { file = Just
-                                     { path = moduleOutPath config moduleName
-                                     , source = Emit.emitQueryModule
-                                           config.modulePrefix
-                                           moduleName
-                                           res.stmts
-                                     }
+                               { file =
+                                   Just
+                                       { path = moduleOutPath config moduleName
+                                       , source =
+                                           Emit.emitQueryModule
+                                               config.modulePrefix
+                                               moduleName
+                                               res.stmts
+                                       }
                                , warnings = res.warnings
                                , generated = List.length res.stmts
                                })
@@ -475,8 +483,9 @@ runInfer config cat ts tokens parsed anno st =
                 addSkip ts e st
 
             Ok rs ->
-                { st | stmts = rs :: st.stmts
-                , assigned = addAssigned anno.name st.assigned
+                { st
+                    | stmts = rs :: st.stmts
+                    , assigned = addAssigned anno.name st.assigned
                 }
 
 
@@ -492,9 +501,9 @@ addAssigned name assigned =
 
     else
         name :: assigned
+
+
 -- Smallest integer suffix that makes `base` unique within the module.
-
-
 makeUnique : String -> List String -> String
 makeUnique base assigned =
     if not (List.member base assigned) then
@@ -514,11 +523,11 @@ suffixGo base i assigned =
 
         else
             candidate
+
+
 -- ---------------------------------------------------------------------------
 -- Paths / names
 -- ---------------------------------------------------------------------------
-
-
 baseNameOf : String -> String
 baseNameOf path =
     let
@@ -570,11 +579,11 @@ locate file line e =
                 raw
     in
         Error.invalidInput (file ++ ":" ++ String.fromInt line ++ ": " ++ msg)
+
+
 -- A skip warning line: `[skip] file:line: <reason>` (reason stripped of the
 -- `InvalidInput: ` prefix). Surfaced to the operator; the statement is excluded
 -- and the rest of the run continues.
-
-
 skipWarn : String -> Int -> Error -> String
 skipWarn file line e =
     let

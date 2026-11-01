@@ -34,13 +34,13 @@ type alias AutoName =
     { base : String
     , card : Cardinality
     }
+
+
 -- ---------------------------------------------------------------------------
 -- Base-name assembly
 -- ---------------------------------------------------------------------------
 -- verb (lowercase) + entity (PascalCase, singularised when `singular`) + the
 -- pre-built `By<cols>` suffix. An empty entity falls back to `Query`.
-
-
 deriveName : Catalog -> ParsedStmt -> List Token -> AutoName
 deriveName cat parsed tokens =
     case parsed of
@@ -50,29 +50,34 @@ deriveName cat parsed tokens =
 
         PInsert ins ->
             { base = verbEntity "create" ins.table True ""
-            , card = if List.isEmpty ins.returning then
-                  CExecRows
+            , card =
+                if List.isEmpty ins.returning then
+                    CExecRows
 
-              else
-                  COne
+                else
+                    COne
             }
 
         PUpdate upd ->
-            { base = verbEntity "update" upd.table True (byPart (whereEqCols tokens))
-            , card = if List.isEmpty upd.returning then
-                  CExecRows
+            { base =
+                verbEntity "update" upd.table True (byPart (whereEqCols tokens))
+            , card =
+                if List.isEmpty upd.returning then
+                    CExecRows
 
-              else
-                  CMany
+                else
+                    CMany
             }
 
         PDelete del ->
-            { base = verbEntity "delete" del.table True (byPart (whereEqCols tokens))
-            , card = if List.isEmpty del.returning then
-                  CExecRows
+            { base =
+                verbEntity "delete" del.table True (byPart (whereEqCols tokens))
+            , card =
+                if List.isEmpty del.returning then
+                    CExecRows
 
-              else
-                  CMany
+                else
+                    CMany
             }
 
         PCreate _ ->
@@ -94,11 +99,12 @@ deriveSelect cat sel tokens =
                 "list"
     in
         { base = verbEntity verb sel.fromTable (verb /= "list") (byPart eqCols)
-        , card = if isOne then
-              COne
+        , card =
+            if isOne then
+                COne
 
-          else
-              CMany
+            else
+                CMany
         }
 
 
@@ -125,11 +131,11 @@ byPart cols =
 
     else
         "By" ++ String.join "And" (List.map Naming.snakeToPascal cols)
+
+
 -- ---------------------------------------------------------------------------
 -- WHERE equality columns bound to params (col = @p / t.col = @p / @p = col)
 -- ---------------------------------------------------------------------------
-
-
 whereEqCols : List Token -> List String
 whereEqCols tokens =
     case dropUntilWhere tokens of
@@ -177,27 +183,27 @@ scanEq tokens acc =
 
         [] ->
             List.reverse acc
+
+
 -- ---------------------------------------------------------------------------
 -- Cardinality helpers
 -- ---------------------------------------------------------------------------
 -- True when any of the given columns is a PRIMARY KEY or UNIQUE column of the
 -- queried table (so a `col = @p` equality selects at most one row).
-
-
 anyKeyCol : Catalog -> String -> List String -> Bool
 anyKeyCol cat tableName cols =
     case Catalog.lookup tableName cat of
 
         Nothing ->
             False
--- ---------------------------------------------------------------------------
--- Small helpers
--- ---------------------------------------------------------------------------
 
         Just table ->
             List.any (\c -> isKeyCol table c) cols
 
 
+-- ---------------------------------------------------------------------------
+-- Small helpers
+-- ---------------------------------------------------------------------------
 isKeyCol : CatTable -> String -> Bool
 isKeyCol table col =
     case List.find

@@ -1214,7 +1214,7 @@ scalarShape : List ResolvedColumn -> Result Error ResultShape
 scalarShape cols =
     case cols of
 
-        [c] ->
+        [ c ] ->
             Ok (ScalarType c)
 
         _ ->
@@ -1231,7 +1231,7 @@ shapeFor : Prepared -> List SelectItem -> Bool -> List ScopeEntry -> List Resolv
 shapeFor prep items hasJoins scope cols =
     case scope of
 
-        [only] ->
+        [ only ] ->
             if not hasJoins && only.table.modelName /= ""
                 && reusesModel items only.table then
                 ReuseModel only.table.modelName only.table.decoderName
@@ -1888,7 +1888,7 @@ findColumnInScope scope qualOpt col =
                 [] ->
                     Err (Error.invalidInput ("unknown column '" ++ col ++ "'"))
 
-                [m] ->
+                [ m ] ->
                     Ok m
 
                 _ ->
@@ -1941,7 +1941,7 @@ reusesModel : List SelectItem -> CatTable -> Bool
 reusesModel items table =
     case items of
 
-        [SiStar Nothing] ->
+        [ SiStar Nothing ] ->
             True
 
         _ ->
@@ -2030,8 +2030,7 @@ spanIdent chars acc =
 isIdentCharR : Char -> Bool
 isIdentCharR c =
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-        || c
-        == '_'
+        || c == '_'
 
 
 dropForceChar : List Char -> List Char

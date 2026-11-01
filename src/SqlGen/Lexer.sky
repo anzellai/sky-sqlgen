@@ -24,11 +24,11 @@ isIdentStart c =
 isIdentChar : Char -> Bool
 isIdentChar c =
     Char.isAlpha c || Char.isDigit c || c == '_'
+
+
 -- ===========================================================================
 -- Tokenizer  (SQL text -> List Token).  Comments already stripped by splitter.
 -- ===========================================================================
-
-
 lex : String -> List Token
 lex s =
     lexGo (String.toList s) []
@@ -115,9 +115,9 @@ takeForce chars =
 
         _ ->
             ( FNone, chars )
+
+
 -- single-quoted string literal; '' is an escaped quote
-
-
 takeString : List Char -> List Char -> ( String, List Char )
 takeString chars acc =
     case chars of
@@ -133,9 +133,9 @@ takeString chars acc =
 
         c :: rest ->
             takeString rest (c :: acc)
+
+
 -- double-quoted identifier
-
-
 takeQuoted : List Char -> List Char -> ( String, List Char )
 takeQuoted chars acc =
     case chars of
@@ -148,9 +148,9 @@ takeQuoted chars acc =
 
         c :: rest ->
             takeQuoted rest (c :: acc)
+
+
 -- operators / punctuation, longest-match for two-char ops
-
-
 takeSym : List Char -> ( String, List Char )
 takeSym chars =
     case chars of
@@ -175,10 +175,10 @@ takeSym chars =
 
         [] ->
             ( "", [] )
+
 -- ===========================================================================
 -- Statement splitter  (raw file -> annotated raw statements)
 -- ===========================================================================
-
 type alias SplitState =
     { line : Int
     , buf : List Char
@@ -214,19 +214,21 @@ flushBuf : SplitState -> SplitState
 flushBuf st =
     if emptyBuf st.buf then
         st
--- ===========================================================================
--- Annotation parsing  (RawAnno -> Annotation)
--- ===========================================================================
 
+    -- ===========================================================================
+    -- Annotation parsing  (RawAnno -> Annotation)
+    -- ===========================================================================
     else
-        { st | results = { anno = st.pending
-          , sql = String.trim (String.fromList (List.reverse st.buf))
-          , line = st.stmtLine
-          }
-              :: st.results
-        , buf = []
-        , stmtLine = 0
-        , pending = Nothing
+        { st
+            | results =
+                { anno = st.pending
+                , sql = String.trim (String.fromList (List.reverse st.buf))
+                , line = st.stmtLine
+                }
+                    :: st.results
+            , buf = []
+            , stmtLine = 0
+            , pending = Nothing
         }
 
 
@@ -305,13 +307,19 @@ applyComment comment st =
         case st.pending of
 
             Just anno ->
-                { st | pending = Just
-                      { anno | directiveLines = List.append anno.directiveLines [comment]
-                      }
+                { st
+                    | pending =
+                        Just
+                            { anno
+                                | directiveLines =
+                                    List.append anno.directiveLines [ comment ]
+                            }
                 }
 
             Nothing ->
-                { st | pending = Just { nameLine = "", directiveLines = [comment] }
+                { st
+                    | pending =
+                        Just { nameLine = "", directiveLines = [ comment ] }
                 }
 
     else
