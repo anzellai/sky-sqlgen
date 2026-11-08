@@ -11,7 +11,7 @@ on:
 # Pinned Sky compiler image. A new Sky tag must not silently change what CI
 # builds. Move the tag and the digest together to change Sky release.
 env:
-  SKY_IMAGE: anzel/sky:0.29.2@sha256:98b5558c41f686775210f113eea3c4b6c3f5a6f32ac4b9c5d1f2d76bf45b3a93
+  SKY_IMAGE: anzel/sky:0.29.3@sha256:564b85333379a2a48a67dc8a443dcc650fca7657686322af33a77c0bbbb0836f
 
 jobs:
   build:
